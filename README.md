@@ -4,7 +4,37 @@
 
 Current build: **v0.10.30**
 
+
+> **Current focus:** practical VFX reconstruction inside Nuke — solving the lens and camera, building rough spatial context, masking unreliable tracking regions, and turning artist-drawn 2D guides into usable 3D projection surfaces.
 > AutoLens is intended as a practical VFX utility for shots where camera solve, undistortion, set reconstruction, projection geometry, and artist-guided scene understanding all need to be derived from the photography itself.
+
+---
+
+## Visual Overview
+
+### Guided surfaces directly in the AutoLens viewer
+
+AutoLens lets the artist define planar surfaces directly over the plate. Each surface can have its **own guide frame**, which is useful when a camera move reveals different parts of the environment at different times.
+
+![AutoLens surface guide workspace](docs/images/autolens-surface-guides.png)
+
+**Green** surfaces are being viewed on their assigned guide frame. Surfaces authored on another frame fade to **gray/white**, while blue timeline markers show where guide frames exist throughout the shot.
+
+### Camera-tracking masks
+
+Moving actors, vehicles, reflections, or other foreground motion can contaminate a reconstruction. AutoLens accepts an external alpha matte and previews the area excluded from feature tracking directly in the workspace.
+
+![AutoLens tracking mask workflow](docs/images/autolens-tracking-mask.png)
+
+The translucent red overlay represents the region AutoLens will avoid during tracking. The mask interpretation can be inverted when the matte instead represents the area that should be tracked.
+
+### From 2D guides to usable projection geometry
+
+The purpose of the reconstruction is not simply to produce a point cloud. AutoLens uses the solved camera, sparse 3D observations, dense proxy geometry, and artist guides to generate practical planar geometry for compositing and projection work.
+
+![AutoLens guided surface projection geometry](docs/images/autolens-guided-surfaces-result.png)
+
+These surfaces can be created individually from the AutoLens node and exported as OBJ geometry with planar 0–1 UVs, making them immediately useful for paint projection, cleanup, set extensions, texture replacement, and CG integration.
 
 ---
 
