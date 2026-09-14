@@ -1,4 +1,4 @@
-# AutoLens for NukeX
+# AutoLens for Nuke
 
 **AutoLens** is an experimental NukeX tool developed by **DeadCow VFX** for estimating lens distortion, solving camera motion, reconstructing rough scene geometry, and building artist-friendly projection surfaces directly from production image sequences — without requiring a photographed lens grid.
 
