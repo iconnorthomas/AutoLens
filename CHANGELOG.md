@@ -89,6 +89,10 @@
   line continuation character" and version-menu sync never ran. Nodes saved with the broken
   callback are repaired when the script opens. Node labels, the Surface Guides labels, a few
   messages and the mask-change log line had the same problem.
+- **Fix: Nuke slowed down after adding an AutoLens node.** With the callback working again, AutoLens'
+  own knob updates fired knobChanged, which scheduled another refresh and rescanned the output
+  folder on every UI tick. The callback now ignores AutoLens' own updates, and the version menu
+  only writes knobs whose value actually changed.
 - **Fix: mesh-fit planes OBJ loaded as nothing.** It was written with literal backslash-n.
 - **AutoLens is now licensed under Apache 2.0.** `LICENSE` and `NOTICE` replace
   `LICENSE_NOT_SPECIFIED.md`, and both ship in the release zip.
