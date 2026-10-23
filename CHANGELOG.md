@@ -57,6 +57,28 @@
 - **Fix: Create from solve failed for Proxy Mesh, Mesh-fit Planes and Guided Surfaces
   (Combined)** with `name 'json' is not defined`. Guided surfaces now show their
   friendly names in the list again.
+- **Fast scrubbing and real-time playback in the workspace viewer.** Frames are decoded on
+  background threads at viewer size into a memory-bounded cache (1 GB by default; set
+  `AUTOLENS_PREVIEW_CACHE_MB` to change it), and neighbouring frames are prefetched. Dragging
+  the timeline shows the nearest cached frame at once; Nuke's frame, the surfaces and the mask
+  overlay follow when the drag settles. New transport bar: first/previous/play backwards/play/
+  next/last, Loop and an fps box (defaults to the script's fps). Playback runs in real time and
+  waits for frames when decoding falls behind. Keys: Space play/pause, ←/→ or ,/. step
+  (Shift = 10 frames), Home/End. A green bar under the timeline shows the frames in memory.
+- **Plates are read straight from disk, like Mocha: open, press Play, and it plays.** Nothing is
+  rendered or re-encoded and no image files are written. JPEG/PNG/TIFF frames are decoded by Qt
+  on background threads; EXR and DPX frames by a pool of frame-server processes in AutoLens's
+  managed Python (numpy + OpenEXR), which read only the R/G/B channels, scale to the viewer and
+  send 8-bit sRGB back over a pipe. Colour follows the Read's colorspace knob (linear, sRGB,
+  Rec.709, gamma, Cineon) through Nuke's default sRGB view; other OCIO spaces are approximated
+  and say so. Decoded frames stay in a memory-bounded cache; when decoding falls behind, playback
+  waits for the next frame rather than skipping. If nodes sit between the Read and AutoLens, a
+  note says the viewer shows the Read's source. Without the managed Python, EXR/DPX plates show
+  a clear message instead of an image.
+- Zoom and pan are kept while stepping or playing; zooming in loads the settled frame at full
+  resolution.
+- Fix: the workspace's keyboard shortcuts used `QtGui.QShortcut`, which only exists in Qt 6;
+  PySide2 (Nuke 14/15) has it in `QtWidgets`.
 
 - **Build label for test installs.** Installing from a git checkout records the branch, commit,
   pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
