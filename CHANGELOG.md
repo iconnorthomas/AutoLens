@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+<<<<<<< HEAD
 - **Hard shots: sparse-solve recovery ladder.** When the incremental mapper fails or registers
   under 80% of the frames, the engine now retries in stages before the global-SfM fallback:
   relaxed initial-pair and registration limits, low-parallax limits (nodal and push-in shots),
@@ -20,6 +21,12 @@
   (`registration_coverage`: unregistered frames, their frame ranges and the longest
   unregistered run), plus a `sparse_recovery` report of every retry rung.
 
+=======
+- **Build label for test installs.** Installing from a git checkout records the branch, commit,
+  pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
+  shows it next to the version, e.g. `AutoLens 0.10.30 (PR #8 · d9bf93a)`. Release installs show
+  only the version.
+>>>>>>> origin/chore/build-stamp
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep
