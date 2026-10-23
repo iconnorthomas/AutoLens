@@ -1,0 +1,113 @@
+# Posts an AutoLens release when a vX.Y.Z tag is pushed. Every release ships a
+# zip built here from that exact commit, so users always get matching code.
+#
+# 1. check:   the tag matches __version__ in that commit (and the installer), the
+#             commit is on main, it's newer than every earlier release, the
+#             CHANGELOG has its notes, and the tests pass.
+# 2. package: AutoLens_NukeX_vX.Y.Z.zip, checked to hold the plugin, the
+#             installer and exactly this version.
+# 3. publish: the GitHub Release with the CHANGELOG notes and the zip.
+#
+# Anything wrong and nothing is posted: delete the tag, fix, tag again.
+#
+# Pull requests that touch the packaging or this workflow get a dry run: the
+# same package and checks, without the tag checks and without posting.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths:
+      - "scripts/release.py"
+      - "install_autolens.*"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check the version
+        if: github.event_name == 'push'
+        run: python scripts/release.py check-release --tag "${GITHUB_REF_NAME}" --main origin/main --notes notes.md
+      - name: Install engine dependencies
+        run: python -m pip install numpy OpenEXR
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+      - name: Version to package
+        id: version
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then v="${GITHUB_REF_NAME#v}"
+          else v=$(python scripts/release.py version); fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Packaging AutoLens $v"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: notes
+          path: notes.md
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  package:
+    name: Package zip
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build the release zip
+        run: python scripts/release.py package --out dist
+      - name: Check the zip is this version
+        run: python scripts/release.py check-package "dist/AutoLens_NukeX_v${{ needs.check.outputs.version }}.zip" --version "${{ needs.check.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist/AutoLens_NukeX_v*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Post release
+    if: github.event_name == 'push'
+    needs: [check, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Post the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          zip="dist/package/AutoLens_NukeX_v${version}.zip"
+          ls -la dist/*
+          if [ ! -f "$zip" ]; then
+            echo "ERROR: no AutoLens_NukeX_v${version}.zip was built; not posting." >&2
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" "$zip" \
+            --title "AutoLens ${version}" --notes-file dist/notes/notes.md --verify-tag

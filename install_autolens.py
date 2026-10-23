@@ -8,11 +8,12 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.10.30"
+VERSION = "0.11.0"
 
 MINIFORGE_URL = (
     "https://github.com/conda-forge/miniforge/releases/latest/download/"
@@ -42,7 +43,12 @@ _REPORT = {
 
 def log(message=""):
     text = str(message)
-    print(text, flush=True)
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        # stdout redirected to a cp1252 file/pipe; never let logging stop the install.
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="replace").decode(encoding), flush=True)
     try:
         TARGET.mkdir(parents=True, exist_ok=True)
         with LIVE_LOG.open("a", encoding="utf-8") as f:
@@ -94,7 +100,20 @@ def run_stream(cmd, cwd=None, env=None, timeout=None):
     log()
     log("> " + subprocess.list2cmdline(cmd))
 
+    proc = None
+    watchdog = None
+    timed_out = threading.Event()
+
+    def _kill_on_timeout():
+        timed_out.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
     try:
+        # Child tools (pip, conda, Miniforge) print UTF-8 progress glyphs; the
+        # locale codec would raise mid-stream and abandon a still-running child.
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
@@ -102,8 +121,17 @@ def run_stream(cmd, cwd=None, env=None, timeout=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
+
+        # proc.wait(timeout) only runs after stdout closes, so a hung child that
+        # keeps its pipe open would never time out. Kill it from a timer instead.
+        if timeout:
+            watchdog = threading.Timer(timeout, _kill_on_timeout)
+            watchdog.daemon = True
+            watchdog.start()
 
         captured = []
         assert proc.stdout is not None
@@ -113,18 +141,24 @@ def run_stream(cmd, cwd=None, env=None, timeout=None):
             captured.append(line)
             log(line)
 
-        proc.wait(timeout=timeout)
+        proc.wait()
+        if timed_out.is_set():
+            return -1, "Process timed out.\n" + "\n".join(captured)
         return proc.returncode, "\n".join(captured)
 
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return -1, "Process timed out."
-
     except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return -1, str(exc)
+
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        if proc is not None and proc.stdout is not None:
+            proc.stdout.close()
 
 
 def run_capture(cmd, cwd=None, env=None, timeout=60):
@@ -135,11 +169,28 @@ def run_capture(cmd, cwd=None, env=None, timeout=60):
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except Exception as exc:
         return -1, "", str(exc)
+
+
+def _restore_preserved(preserve_root: Path, target: Path):
+    """Move runtimes parked in preserve_root back into target (never overwrite)."""
+    restored = []
+    if not preserve_root.is_dir():
+        return restored
+    for item in preserve_root.iterdir():
+        dest = target / item.name
+        if dest.exists():
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(item), str(dest))
+        restored.append(item.name)
+    return restored
 
 
 def install_plugin(source: Path, target: Path, nuke_dir: Path):
@@ -153,23 +204,54 @@ def install_plugin(source: Path, target: Path, nuke_dir: Path):
         ".managed_colmap",
     )
 
+    source_resolved = source.resolve()
+    target_resolved = target.resolve()
+    if source_resolved == target_resolved:
+        # The package was unzipped straight into ~/.nuke; deleting the target
+        # would delete the plugin being installed.
+        log(f"Plugin is already in place:\n  {target}")
+        preserve_names = ()
+    else:
+        try:
+            source_resolved.relative_to(target_resolved)
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError(
+                "The installer is running from inside the folder it replaces:\n"
+                f"  {source}\n"
+                "Move the unzipped AutoLens package somewhere else (for example "
+                "Downloads) and run the installer again."
+            )
+
     preserve_root = nuke_dir / ".autolens_upgrade_preserve"
+    # An earlier run that stopped mid-upgrade leaves the managed runtimes here.
+    # Put them back first instead of deleting several GB of environments.
+    restored = _restore_preserved(preserve_root, target)
+    if restored:
+        log("Recovered runtimes from an interrupted upgrade: " + ", ".join(restored))
     shutil.rmtree(preserve_root, ignore_errors=True)
     preserve_root.mkdir(parents=True, exist_ok=True)
 
     preserved = []
 
-    if target.exists():
-        for name in preserve_names:
-            item = target / name
-            if item.exists():
-                dest = preserve_root / name
-                shutil.move(str(item), str(dest))
-                preserved.append(name)
+    try:
+        if target.exists() and source_resolved != target_resolved:
+            for name in preserve_names:
+                item = target / name
+                if item.exists():
+                    dest = preserve_root / name
+                    shutil.move(str(item), str(dest))
+                    preserved.append(name)
 
-        shutil.rmtree(target)
+            shutil.rmtree(target)
 
-    shutil.copytree(source, target)
+        if source_resolved != target_resolved:
+            shutil.copytree(source, target)
+    except Exception:
+        # For example a file in the old plugin is locked by a running Nuke.
+        _restore_preserved(preserve_root, target)
+        raise
 
     for name in preserved:
         old = preserve_root / name
@@ -203,6 +285,66 @@ def install_plugin(source: Path, target: Path, nuke_dir: Path):
             )
 
     log(f"Plugin installed to:\n  {target}")
+
+    info = build_info_from_git(source.parent)
+    build_file = target / "autolens_build.json"
+    if info:
+        build_file.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        log(f"Build: {info.get('branch')} {info.get('commit')}"
+            + (f" (PR #{info['pr']})" if info.get("pr") else ""))
+    elif build_file.exists():
+        build_file.unlink()
+
+
+GITHUB_REPO = "iconnorthomas/AutoLens"
+
+
+def _git(repo: Path, *args):
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def find_pr_number(branch, fetch=None):
+    """The newest GitHub pull request for this branch, or None (offline, or no PR)."""
+    if not branch or branch == "HEAD":
+        return None
+    owner = GITHUB_REPO.split("/")[0]
+    url = (f"https://api.github.com/repos/{GITHUB_REPO}/pulls"
+           f"?head={owner}:{branch}&state=all&per_page=1")
+    try:
+        if fetch is None:
+            req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        else:
+            data = fetch(url)
+    except Exception:
+        return None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0].get("number")
+    return None
+
+
+def build_info_from_git(repo: Path, git=None, fetch=None):
+    """{branch, commit, dirty, pr} when installing from a git checkout, else {}."""
+    git = git or (lambda *args: _git(repo, *args))
+    commit = git("rev-parse", "--short", "HEAD")
+    if not commit:
+        return {}
+    branch = git("rev-parse", "--abbrev-ref", "HEAD") or ""
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "branch": branch,
+        "commit": commit,
+        "dirty": bool(status),
+        "pr": find_pr_number(branch, fetch),
+    }
 
 
 def setup_python_runtime(target: Path):
@@ -673,7 +815,8 @@ def main():
         raise SystemExit(
             fail(
                 "platform-check",
-                "v0.9.3 managed CUDA backend currently targets Windows.",
+                "The installer and its managed CUDA COLMAP backend "
+                "currently support Windows only.",
                 2,
             )
         )

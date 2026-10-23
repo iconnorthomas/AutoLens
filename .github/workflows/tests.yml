@@ -1,0 +1,56 @@
+# Runs AutoLens' unit tests on every pull request and on pushes to main.
+# The tests need only the standard library plus numpy and OpenEXR (the engine's own
+# dependencies); nothing imports `nuke`, so no Nuke license, GPU or COLMAP is needed.
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Nuke 14 ships Python 3.9, Nuke 15 ships 3.10, Nuke 16 and 17 ship 3.11.
+        # The managed engine environment is Python 3.11.
+        os: [windows-latest]
+        python: ["3.9", "3.10", "3.11"]
+        include:
+          # AutoLens also loads on Linux via NUKE_PATH.
+          - os: ubuntu-latest
+            python: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install engine dependencies
+        run: python -m pip install numpy OpenEXR
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  # A branch that changes __version__ must raise it above main and every posted
+  # release (several branches can be open at once). See scripts/release.py.
+  version:
+    name: Version check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # main and the release tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check the version number
+        run: python scripts/release.py check-pr --base "origin/${{ github.base_ref }}"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import time
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,7 @@ except ImportError:
     Signal = QtCore.Signal
 
 from . import PANEL_ID
-from .paths import engine_path, find_result_nk, next_version_folder
+from .paths import count_image_files, engine_path, find_result_nk, next_version_folder
 from .pixel_aspect import source_format_info, ensure_square_pixel_proxy
 from .tracking_masks import (
     mask_input_connected,
@@ -28,6 +29,12 @@ from .tracking_masks import (
 from .environment import normalize_colmap_path, build_colmap_invocation, windows_status_hex
 from .runner import AutoLensRunner
 from .importer import import_result
+from .ux import (
+    QUALITY_PRESETS, QUALITY_ORDER, RUN_MODES, preset_name, preset_summary,
+    settings_match_preset, run_mode_args, solve_args, geometry_only_args, current_step, step_hint,
+    UI_TIMING_FILE, ui_timing_payload, track_time, timing_lines, load_result,
+    step_indicator_html, explain_failure, failure_message, format_duration,
+)
 from .surface_guides import (
     ensure_guide_node, auto_suggest_surfaces, export_surface_guides,
     find_guide_node, shape_count, set_guide_frame_to_current,
@@ -37,21 +44,33 @@ from .surface_guides import (
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".exr"}
 
-QUALITY = {
-    "Preview": {"quality": "preview", "resolution": 1800, "target": 8, "minimum": 5, "coverage": 0.90, "sources": 6},
-    "Normal":  {"quality": "normal",  "resolution": 3200, "target": 12, "minimum": 6, "coverage": 0.97, "sources": 8},
-    "High":    {"quality": "high",    "resolution": 4000, "target": 18, "minimum": 8, "coverage": 0.99, "sources": 12},
-}
+# Kept as a module-level name for scripts that imported panel.QUALITY.
+QUALITY = QUALITY_PRESETS
+
+
+_INSTALL_CONFIG_CACHE = {}
 
 
 def _install_config():
+    # Read several times while the workspace opens; re-read only when the
+    # installer has rewritten the file.
     path = Path.home() / ".nuke" / "AutoLens" / "autolens_install.json"
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+        stat = path.stat()
+    except OSError:
+        return {}
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if _INSTALL_CONFIG_CACHE.get("key") == key:
+        return dict(_INSTALL_CONFIG_CACHE["value"])
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    return {}
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    _INSTALL_CONFIG_CACHE["key"] = key
+    _INSTALL_CONFIG_CACHE["value"] = value
+    return dict(value)
 
 def _install_report_path():
     return Path.home() / ".nuke" / "AutoLens" / "AutoLens_Install_Report.txt"
@@ -119,6 +138,18 @@ class AutoLensPanel(QtWidgets.QWidget):
         self.runner = AutoLensRunner(self)
         self.source_read_fullname = None
         self.last_result_nk = None
+        self.last_failure = None
+        self._imported = False
+        self._install_ready = False
+        self._geometry_run = False
+        self._run_kind = "track"
+        self.last_prep_seconds = 0.0
+        self.last_run_timing = None
+        # True while the engine process is a Build geometry run, not a track.
+        self.geometry_build_running = False
+        # Refreshes elapsed time / ETA between the engine's stage updates.
+        self._progress_timer = QtCore.QTimer(self)
+        self._progress_timer.setInterval(1000)
         self._build_ui()
         self._connect()
         self._restore_settings()
@@ -133,6 +164,7 @@ class AutoLensPanel(QtWidgets.QWidget):
                 self.use_selected_read(stored_node)
         self._update_guide_status()
         self._update_run_button_text()
+        self._update_input_info()
 
     def _build_ui(self):
         self.setObjectName("AutoLensPanel")
@@ -147,14 +179,48 @@ class AutoLensPanel(QtWidgets.QWidget):
         subtitle.setWordWrap(True); subtitle.setStyleSheet("color: #9a9a9a;")
         root.addWidget(title); root.addWidget(subtitle)
 
-        input_group = QtWidgets.QGroupBox("1. Input")
+        # Where the artist is in Setup -> Solve -> Review -> Create, and what to
+        # do next. Updated by _update_step_indicator().
+        self.step_label = QtWidgets.QLabel()
+        self.step_label.setTextFormat(QtCore.Qt.RichText)
+        self.step_label.setToolTip(
+            "Setup: connect the plate and install AutoLens.\n"
+            "Solve: pick a quality and click Solve.\n"
+            "Review: check the result and the log.\n"
+            "Create: build the camera, lens and geometry in the comp."
+        )
+        self.step_hint_label = QtWidgets.QLabel()
+        self.step_hint_label.setWordWrap(True)
+        self.step_hint_label.setStyleSheet("color: #bdbdbd;")
+        root.addWidget(self.step_label)
+        root.addWidget(self.step_hint_label)
+
+        input_group = QtWidgets.QGroupBox("1. Shot")
         gl = QtWidgets.QGridLayout(input_group)
         self.source_edit = QtWidgets.QLineEdit()
+        self.source_edit.setToolTip(
+            "Folder holding the plate's image sequence. Filled in automatically "
+            "from the Read connected to AutoLens."
+        )
         self.source_browse = QtWidgets.QPushButton("Browse…")
+        self.source_browse.setToolTip("Choose the image folder by hand instead of from a Read node.")
         self.selected_read_button = QtWidgets.QPushButton("Use Selected Read")
+        self.selected_read_button.setToolTip(
+            "Use the Read node selected in the Node Graph as the plate. Also resets "
+            "the output root to <plate folder>/AutoLens."
+        )
         self.input_info = QtWidgets.QLabel("No input selected."); self.input_info.setStyleSheet("color: #9a9a9a;")
         self.output_edit = QtWidgets.QLineEdit(); self.output_browse = QtWidgets.QPushButton("Browse…")
+        self.output_edit.setToolTip(
+            "Where solves are written. Defaults to an AutoLens folder beside the plate. "
+            "Each solve goes in its own version subfolder (v1, v2, …)."
+        )
+        self.output_browse.setToolTip("Choose a different output root folder.")
         self.version_combo = QtWidgets.QComboBox()
+        self.version_combo.setToolTip(
+            "Latest reuses the newest solve; pick an older version to review it, or "
+            "Create New to keep the existing solves untouched."
+        )
         gl.addWidget(QtWidgets.QLabel("Image folder"), 0, 0); gl.addWidget(self.source_edit, 0, 1); gl.addWidget(self.source_browse, 0, 2)
         gl.addWidget(self.selected_read_button, 1, 1)
         gl.addWidget(self.input_info, 2, 1, 1, 2)
@@ -162,13 +228,20 @@ class AutoLensPanel(QtWidgets.QWidget):
         gl.addWidget(QtWidgets.QLabel("Solve version"), 4, 0); gl.addWidget(self.version_combo, 4, 1, 1, 2)
         root.addWidget(input_group)
 
-        self.guide_group = QtWidgets.QGroupBox("2. Surface Guides (optional)")
+        self.guide_group = QtWidgets.QGroupBox("Surface Guides (optional)")
         sg = QtWidgets.QGridLayout(self.guide_group)
         self.guide_create_button = QtWidgets.QPushButton("Create / Edit Surface Guides")
+        self.guide_create_button.setToolTip("Create the hidden Roto node that stores surface guide shapes.")
         self.guide_auto_button = QtWidgets.QPushButton("Auto Suggest from Current Frame")
+        self.guide_auto_button.setToolTip("Guess rough floor, wall and object planes on the current frame.")
         self.guide_frame_button = QtWidgets.QPushButton("Set Guide Frame = Current")
+        self.guide_frame_button.setToolTip("Evaluate the guide shapes on the current frame.")
         self.use_guides_checkbox = QtWidgets.QCheckBox("Use drawn surfaces when building 3D geometry")
         self.use_guides_checkbox.setChecked(True)
+        self.use_guides_checkbox.setToolTip(
+            "Fit a projection plane to each surface drawn in the Surfaces tab. "
+            "Has no effect when no surfaces exist."
+        )
         self.guide_status = QtWidgets.QLabel("No surface guide Roto node yet.")
         self.guide_status.setWordWrap(True)
         self.guide_status.setStyleSheet("color: #9a9a9a;")
@@ -179,32 +252,131 @@ class AutoLensPanel(QtWidgets.QWidget):
         sg.addWidget(self.guide_status, 4, 0, 1, 2)
         root.addWidget(self.guide_group)
 
-        quality_group = QtWidgets.QGroupBox("3. Reconstruction")
-        ql = QtWidgets.QGridLayout(quality_group)
-        self.quality_combo = QtWidgets.QComboBox(); self.quality_combo.addItems(["Preview", "Normal", "High"])
+        # One primary action: pick a quality, click Solve.
+        run_group = QtWidgets.QGroupBox("2. Solve")
+        rl = QtWidgets.QVBoxLayout(run_group)
+
+        quality_row = QtWidgets.QHBoxLayout()
+        self.quality_combo = QtWidgets.QComboBox(); self.quality_combo.addItems(list(QUALITY_ORDER))
+        self.quality_combo.setToolTip(
+            "\n".join(f"{name}: {preset_summary(name)}" for name in QUALITY_ORDER)
+            + "\n\nThe exact settings are under Advanced."
+        )
+        quality_row.addWidget(QtWidgets.QLabel("Quality"))
+        quality_row.addWidget(self.quality_combo, 1)
+        rl.addLayout(quality_row)
         self.quality_summary = QtWidgets.QLabel(); self.quality_summary.setWordWrap(True); self.quality_summary.setStyleSheet("color: #9a9a9a;")
-        self.run_mode = QtWidgets.QComboBox(); self.run_mode.addItems(["Resume / reuse cached stages", "Rebuild dense only", "Rebuild everything"])
-        self.sparse_gpu = QtWidgets.QCheckBox("GPU accelerate feature extraction / matching"); self.sparse_gpu.setChecked(True)
-        self.import_when_done = QtWidgets.QCheckBox("Import AutoLens nodes into current comp when complete"); self.import_when_done.setChecked(True)
-        ql.addWidget(QtWidgets.QLabel("Quality"), 0, 0); ql.addWidget(self.quality_combo, 0, 1)
-        ql.addWidget(self.quality_summary, 1, 1, 1, 2)
-        ql.addWidget(QtWidgets.QLabel("Run mode"), 2, 0); ql.addWidget(self.run_mode, 2, 1, 1, 2)
-        ql.addWidget(self.sparse_gpu, 3, 1, 1, 2); ql.addWidget(self.import_when_done, 4, 1, 1, 2)
-        root.addWidget(quality_group)
+        rl.addWidget(self.quality_summary)
+
+        self.import_when_done = QtWidgets.QCheckBox("Create camera, lens and geometry in the comp when the solve finishes")
+        self.import_when_done.setChecked(True)
+        self.import_when_done.setToolTip(
+            "Runs Create All automatically after a successful solve. Turn off to "
+            "review the solve first and click Create All yourself."
+        )
+        rl.addWidget(self.import_when_done)
+
+        self.completed_result_checkbox = QtWidgets.QCheckBox(
+            "Completed Result Available"
+        )
+        self.completed_result_checkbox.setEnabled(False)
+        self.completed_result_checkbox.setChecked(False)
+        self.completed_result_checkbox.setStyleSheet(
+            "QCheckBox:disabled { color: #858585; font-weight: 600; }"
+        )
+        self.completed_result_checkbox.setToolTip(
+            "Ticked when the selected solve version holds a finished solve."
+        )
+
+        self.stage_label = QtWidgets.QLabel("Ready")
+        self.stage_label.setWordWrap(True)
+        self.progress = QtWidgets.QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
+        buttons = QtWidgets.QHBoxLayout()
+        self.run_button = QtWidgets.QPushButton("Solve"); self.run_button.setMinimumHeight(34)
+        self.run_button.setDefault(True)
+        self.run_button.setStyleSheet(
+            "QPushButton { font-weight: 700; background: #3a6e9a; color: white; }"
+            "QPushButton:disabled { background: #404040; color: #888; }"
+        )
+        self.background_button = QtWidgets.QPushButton("Background")
+        self.background_button.setEnabled(False)
+        self.background_button.setToolTip(
+            "Hide the full AutoLens workspace and keep the solve running "
+            "with a compact progress window."
+        )
+        self.cancel_button = QtWidgets.QPushButton("Cancel"); self.cancel_button.setEnabled(False)
+        self.cancel_button.setToolTip(
+            "Stop the solve. Finished stages are kept, so Solve (Resume) carries on from there."
+        )
+
+        buttons.addWidget(self.run_button, 1)
+        buttons.addWidget(self.background_button)
+        buttons.addWidget(self.cancel_button)
+        rl.addWidget(self.completed_result_checkbox)
+        rl.addWidget(self.stage_label)
+        rl.addWidget(self.progress)
+        rl.addLayout(buttons)
+
+        result_row = QtWidgets.QHBoxLayout()
+        self.import_button = QtWidgets.QPushButton("Create All"); self.import_button.setEnabled(False)
+        self.import_button.setMinimumHeight(30)
+        self.reveal_button = QtWidgets.QPushButton("Reveal Output")
+        self.reveal_button.setToolTip("Open the selected solve version's folder in the file browser.")
+        result_row.addWidget(self.import_button, 1); result_row.addWidget(self.reveal_button)
+        rl.addLayout(result_row)
+        root.addWidget(run_group)
 
         self.advanced_group = QtWidgets.QGroupBox("Advanced")
         self.advanced_group.setCheckable(True); self.advanced_group.setChecked(False)
+        self.advanced_group.setToolTip(
+            "Tick to show the settings behind the Quality preset, the run mode and GPU options. "
+            "Changing a value here overrides the preset for this solve."
+        )
         adv = QtWidgets.QFormLayout(self.advanced_group)
+        self.run_mode = QtWidgets.QComboBox(); self.run_mode.addItems(list(RUN_MODES))
+        self.run_mode.setToolTip(
+            "Resume: reuse every cached stage that is still valid (fastest).\n"
+            "Rebuild dense only: keep the camera solve, redo depth maps, mesh and surfaces.\n"
+            "Rebuild everything: start this version from scratch."
+        )
+        self.sparse_gpu = QtWidgets.QCheckBox("GPU accelerate feature extraction / matching"); self.sparse_gpu.setChecked(True)
+        self.sparse_gpu.setToolTip("Use the GPU for COLMAP features and matching. Turn off only if the GPU stages fail.")
+        self.build_geometry_checkbox = QtWidgets.QCheckBox("Build geometry during the track")
+        self.build_geometry_checkbox.setChecked(True)
+        self.build_geometry_checkbox.setToolTip(
+            "On: one run solves the camera and lens and builds the dense mesh and surfaces.\n"
+            "Off: track the camera and lens only (much faster); build geometry later from Output."
+        )
         self.selection_combo = QtWidgets.QComboBox(); self.selection_combo.addItems(["smart", "step", "all"])
+        self.selection_combo.setToolTip(
+            "How dense reference frames are picked. smart: best-spread viewpoints (recommended); "
+            "step: evenly spaced; all: every frame (slow)."
+        )
         self.resolution_spin = QtWidgets.QSpinBox(); self.resolution_spin.setRange(640, 8192); self.resolution_spin.setSingleStep(100)
+        self.resolution_spin.setToolTip("Longest image side, in pixels, used for dense depth maps. Lower uses less GPU memory.")
         self.target_spin = QtWidgets.QSpinBox(); self.target_spin.setRange(4, 100)
+        self.target_spin.setToolTip("Most dense reference frames smart selection may pick.")
         self.minimum_spin = QtWidgets.QSpinBox(); self.minimum_spin.setRange(4, 100)
+        self.minimum_spin.setToolTip("Fewest dense reference frames, even when coverage is reached early.")
         self.coverage_spin = QtWidgets.QDoubleSpinBox(); self.coverage_spin.setRange(0.50, 1.00); self.coverage_spin.setDecimals(3); self.coverage_spin.setSingleStep(0.01)
+        self.coverage_spin.setToolTip("Fraction of sparse scene points the dense references must see before selection stops.")
         self.sources_spin = QtWidgets.QSpinBox(); self.sources_spin.setRange(2, 50)
+        self.sources_spin.setToolTip("Neighbouring frames compared with each dense reference.")
         self.aperture_spin = QtWidgets.QDoubleSpinBox(); self.aperture_spin.setRange(1.0, 100.0); self.aperture_spin.setDecimals(3); self.aperture_spin.setValue(36.0); self.aperture_spin.setSuffix(" mm")
+        self.aperture_spin.setToolTip(
+            "Filmback width written to the Nuke Camera. Only changes the reported focal length "
+            "in mm, not the solve. Set it to the camera's sensor width when you know it."
+        )
         self.upright_world_checkbox = QtWidgets.QCheckBox("Auto upright world")
         self.upright_world_checkbox.setChecked(True)
+        self.upright_world_checkbox.setToolTip("Rotate the solved scene so the ground is level and Y is up.")
         self.gpus_edit = QtWidgets.QLineEdit("auto"); self.patch_cache_edit = QtWidgets.QLineEdit("auto"); self.fusion_cache_edit = QtWidgets.QLineEdit("auto")
+        self.gpus_edit.setToolTip("GPU indices for dense stages, e.g. 0 or 0,1. auto uses every CUDA GPU.")
+        self.patch_cache_edit.setToolTip("PatchMatch cache size in GB, or auto.")
+        self.fusion_cache_edit.setToolTip("Fusion cache size in GB, or auto.")
+        adv.addRow("Run mode", self.run_mode)
+        adv.addRow("", self.sparse_gpu)
+        adv.addRow("", self.build_geometry_checkbox)
         adv.addRow("Dense selection", self.selection_combo); adv.addRow("Dense max dimension", self.resolution_spin)
         adv.addRow("Max smart references", self.target_spin); adv.addRow("Minimum references", self.minimum_spin)
         adv.addRow("Sparse coverage target", self.coverage_spin); adv.addRow("Source views / reference", self.sources_spin)
@@ -215,53 +387,30 @@ class AutoLensPanel(QtWidgets.QWidget):
         root.addWidget(self.advanced_group)
         self._set_advanced_contents_visible(False)
 
-        env_group = QtWidgets.QGroupBox("4. Installation Status")
+        env_group = QtWidgets.QGroupBox("Installation")
         env = QtWidgets.QGridLayout(env_group)
         self.python_edit = QtWidgets.QLineEdit(); self.python_edit.setReadOnly(True)
+        self.python_edit.setToolTip("Python runtime the AutoLens engine runs in (set by the installer).")
         self.colmap_edit = QtWidgets.QLineEdit(); self.colmap_edit.setReadOnly(True)
+        self.colmap_edit.setToolTip("COLMAP install used for solving (set by the installer).")
         self.install_status = QtWidgets.QLabel("Installation status has not been checked.")
         self.install_status.setWordWrap(True)
         self.check_button = QtWidgets.QPushButton("Refresh Installation Status")
+        self.check_button.setToolTip("Re-read the installer's report, e.g. after running install_autolens.bat.")
         self.install_deps_button = QtWidgets.QPushButton("Open Install Report")
-        env.addWidget(QtWidgets.QLabel("Python runtime"),0,0); env.addWidget(self.python_edit,0,1)
-        env.addWidget(QtWidgets.QLabel("Managed COLMAP"),1,0); env.addWidget(self.colmap_edit,1,1)
-        env.addWidget(self.install_status,2,0,1,2)
+        self.install_deps_button.setToolTip("Open the installer's text report.")
+        # The runtime paths only matter when something is wrong, so they are
+        # hidden while the install is ready (see _refresh_install_status).
+        self.install_details = QtWidgets.QWidget()
+        details = QtWidgets.QGridLayout(self.install_details)
+        details.setContentsMargins(0, 0, 0, 0)
+        details.addWidget(QtWidgets.QLabel("Python runtime"),0,0); details.addWidget(self.python_edit,0,1)
+        details.addWidget(QtWidgets.QLabel("Managed COLMAP"),1,0); details.addWidget(self.colmap_edit,1,1)
+        env.addWidget(self.install_status,0,0,1,2)
+        env.addWidget(self.install_details,1,0,1,2)
         env_buttons=QtWidgets.QHBoxLayout(); env_buttons.addWidget(self.check_button); env_buttons.addWidget(self.install_deps_button)
-        env.addLayout(env_buttons,3,0,1,2)
+        env.addLayout(env_buttons,2,0,1,2)
         root.addWidget(env_group)
-
-        run_group = QtWidgets.QGroupBox("5. Run")
-        rl = QtWidgets.QVBoxLayout(run_group)
-
-        self.completed_result_checkbox = QtWidgets.QCheckBox(
-            "Completed Result Available"
-        )
-        self.completed_result_checkbox.setEnabled(False)
-        self.completed_result_checkbox.setChecked(False)
-        self.completed_result_checkbox.setStyleSheet(
-            "QCheckBox:disabled { color: #858585; font-weight: 600; }"
-        )
-
-        self.stage_label = QtWidgets.QLabel("Ready")
-        self.progress = QtWidgets.QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
-        buttons = QtWidgets.QHBoxLayout()
-        self.run_button = QtWidgets.QPushButton("Run AutoLens"); self.run_button.setMinimumHeight(34)
-        self.background_button = QtWidgets.QPushButton("Background")
-        self.background_button.setEnabled(False)
-        self.background_button.setToolTip(
-            "Hide the full AutoLens workspace and keep the solve running "
-            "with a compact progress window."
-        )
-        self.cancel_button = QtWidgets.QPushButton("Cancel"); self.cancel_button.setEnabled(False)
-
-        buttons.addWidget(self.run_button, 1)
-        buttons.addWidget(self.background_button)
-        buttons.addWidget(self.cancel_button)
-        rl.addWidget(self.completed_result_checkbox)
-        rl.addWidget(self.stage_label)
-        rl.addWidget(self.progress)
-        rl.addLayout(buttons)
-        root.addWidget(run_group)
 
         log_group = QtWidgets.QGroupBox("Log")
         ll = QtWidgets.QVBoxLayout(log_group)
@@ -269,11 +418,6 @@ class AutoLensPanel(QtWidgets.QWidget):
         self.log.setMinimumHeight(170)
         self.log.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
         ll.addWidget(self.log)
-        rb = QtWidgets.QHBoxLayout()
-        self.import_button = QtWidgets.QPushButton("Import Result"); self.import_button.setEnabled(False)
-        self.reveal_button = QtWidgets.QPushButton("Reveal Output")
-        rb.addWidget(self.import_button); rb.addWidget(self.reveal_button); rb.addStretch(1)
-        ll.addLayout(rb)
         root.addWidget(log_group, 1)
 
     def _connect(self):
@@ -320,6 +464,11 @@ class AutoLensPanel(QtWidgets.QWidget):
         self.runner.progress_changed.connect(self._progress_changed)
         self.runner.started.connect(self._process_started)
         self.runner.finished.connect(self._process_finished)
+        self._progress_timer.timeout.connect(self._tick_progress)
+        for spin in (self.resolution_spin, self.target_spin, self.minimum_spin, self.sources_spin):
+            spin.valueChanged.connect(lambda _value: self._update_quality_summary())
+        self.coverage_spin.valueChanged.connect(lambda _value: self._update_quality_summary())
+        self.selection_combo.currentTextChanged.connect(lambda _text: self._update_quality_summary())
 
     def _set_advanced_contents_visible(self, visible):
         # QGroupBox checkable normally only disables its children. For a compact
@@ -344,9 +493,13 @@ class AutoLensPanel(QtWidgets.QWidget):
         py=_installed_python(); cm=_installed_colmap()
         self.python_edit.setText(py)
         self.colmap_edit.setText(cm)
+        self._install_ready = bool(ready and py and cm)
+        self.install_details.setVisible(not self._install_ready)
+        self._update_step_indicator()
         if ready and py and cm:
             self.install_status.setText("✓ " + _installed_backend_label() + " is ready")
             self.install_status.setStyleSheet("color: #7fd27f;")
+            self.install_status.setToolTip(f"Python: {py}\nCOLMAP: {cm}")
         else:
             stage = str(cfg.get("stage") or "unknown")
             error = str(cfg.get("error") or "").strip()
@@ -356,6 +509,7 @@ class AutoLensPanel(QtWidgets.QWidget):
                 if len(short_error) > 100:
                     short_error = short_error[:97] + "..."
                 message += f" — {short_error}"
+            message += "\nWhat to do: close Nuke, run install_autolens.bat, then click Refresh Installation Status."
             self.install_status.setText(message)
             self.install_status.setToolTip(error)
             self.install_status.setStyleSheet("color: #e08080;")
@@ -517,19 +671,36 @@ class AutoLensPanel(QtWidgets.QWidget):
         idx = self.quality_combo.findText(quality)
         if idx >= 0: self.quality_combo.setCurrentIndex(idx)
         self.import_when_done.setChecked(str(self.settings.value("import_when_done", "true")).lower() != "false")
+        self.build_geometry_checkbox.setChecked(str(self.settings.value("build_geometry", "true")).lower() != "false")
         self._refresh_install_status()
 
 
     def _save_settings(self):
         self.settings.setValue("quality", self.quality_combo.currentText())
         self.settings.setValue("import_when_done", self.import_when_done.isChecked())
+        self.settings.setValue("build_geometry", self.build_geometry_checkbox.isChecked())
 
 
     def _quality_changed(self, label):
-        p = QUALITY[label]
+        p = QUALITY[preset_name(label)]
         self.resolution_spin.setValue(p["resolution"]); self.target_spin.setValue(p["target"]); self.minimum_spin.setValue(p["minimum"])
         self.coverage_spin.setValue(p["coverage"]); self.sources_spin.setValue(p["sources"]); self.selection_combo.setCurrentText("smart")
-        self.quality_summary.setText(f"Smart viewpoint selection • up to {p['target']} dense references • {p['resolution']} px • {p['coverage']*100:.0f}% sparse scene coverage")
+        self._update_quality_summary()
+
+    def _update_quality_summary(self):
+        label = self.quality_combo.currentText()
+        text = preset_summary(label)
+        if not settings_match_preset(
+            label,
+            self.resolution_spin.value(),
+            self.target_spin.value(),
+            self.minimum_spin.value(),
+            self.coverage_spin.value(),
+            self.sources_spin.value(),
+            self.selection_combo.currentText(),
+        ):
+            text += " Advanced settings changed: the values under Advanced are used."
+        self.quality_summary.setText(text)
 
     def use_selected_read(self, node=None):
         node = node or _selected_read()
@@ -675,12 +846,23 @@ class AutoLensPanel(QtWidgets.QWidget):
             )
 
     def _update_input_info(self):
-        folder = Path(self.source_edit.text().strip())
+        self._update_step_indicator()
+        text = self.source_edit.text().strip()
+        folder = Path(text)
+        if not text:
+            self.input_info.setText(
+                "No plate yet: connect a Read to AutoLens input 0, or select a Read and click Use Selected Read."
+            )
+            self.input_info.setStyleSheet("color: #e0b060;")
+            return
         if not folder.is_dir():
-            self.input_info.setText("Input folder does not exist."); return
-        count = sum(1 for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS)
+            self.input_info.setText("Input folder does not exist. Check the Read's file path.")
+            self.input_info.setStyleSheet("color: #e08080;")
+            return
+        count = count_image_files(folder, SUPPORTED_IMAGE_EXTENSIONS)
         read_text = f" • Read: {self.source_read_fullname}" if self.source_read_fullname else ""
         self.input_info.setText(f"{count} image files found{read_text}")
+        self.input_info.setStyleSheet("color: #9a9a9a;" if count >= 3 else "color: #e08080;")
 
     def _discover_versions(self):
         root_text = self.output_edit.text().strip()
@@ -925,12 +1107,19 @@ class AutoLensPanel(QtWidgets.QWidget):
     def _build_arguments(self):
         source = self.source_edit.text().strip()
         output = self._resolved_output_folder()
-        if not Path(source).is_dir():
-            raise RuntimeError("Choose a valid input image folder.")
+        if not source or not Path(source).is_dir():
+            raise RuntimeError(
+                "AutoLens doesn't know which plate to solve.\n\n"
+                "What to do: connect the plate's Read to AutoLens input 0 (or select the "
+                "Read and click Use Selected Read), then click Solve again."
+            )
         if not output:
-            raise RuntimeError("Choose an output folder.")
+            raise RuntimeError(
+                "No output folder is set.\n\n"
+                "What to do: click Browse… next to Output root and pick a folder."
+            )
         Path(output).mkdir(parents=True, exist_ok=True)
-        quality_key = QUALITY[self.quality_combo.currentText()]["quality"]
+        quality_key = QUALITY[preset_name(self.quality_combo.currentText())]["quality"]
         solve_source = source
         source_node = self._source_read_node()
         source_format = {"width": 0, "height": 0, "pixel_aspect": 1.0}
@@ -962,10 +1151,13 @@ class AutoLensPanel(QtWidgets.QWidget):
         if self.sparse_gpu.isChecked(): args.append("--use-gpu")
         colmap = self.colmap_edit.text().strip()
         if colmap: args += ["--colmap", colmap]
-        if self.run_mode.currentIndex() == 1:
-            args.append("--force-dense")
-        elif self.run_mode.currentIndex() == 2:
-            args.append("--force")
+        if self._geometry_run:
+            # Build geometry: only the dense stages, from the cached solve. The
+            # engine refuses run-mode flags (--force) with --geometry-only.
+            args += geometry_only_args()
+        else:
+            args += run_mode_args(self.run_mode.currentIndex())
+            args += solve_args(self.build_geometry_checkbox.isChecked())
 
         if not self.upright_world_checkbox.isChecked():
             args.append("--no-upright-world")
@@ -1150,27 +1342,26 @@ class AutoLensPanel(QtWidgets.QWidget):
 
         if reusable:
             self.run_button.setText(
-                "Resume AutoLens"
+                "  Resume Track"
             )
             self.run_button.setToolTip(
-                "Reusable AutoLens cache/reconstruction detected in the "
-                "current output folder. Cached stages will be reused where "
-                "valid."
+                "Track the camera and lens (T). A previous track was found "
+                "in this version folder, so finished stages are reused."
             )
         else:
             self.run_button.setText(
-                "Run AutoLens"
+                "  Track"
             )
 
             if resume_mode:
                 self.run_button.setToolTip(
-                    "Resume mode is selected, but no reusable AutoLens cache "
-                    "was detected in the current output folder. A new solve "
-                    "will start."
+                    "Track the camera and lens from this plate (T), into the "
+                    "selected version folder."
                 )
             else:
                 self.run_button.setToolTip(
-                    "Run AutoLens using the selected rebuild mode."
+                    "Track using the Run mode chosen in Solve settings: "
+                    + self.run_mode.currentText()
                 )
 
 
@@ -1310,7 +1501,9 @@ class AutoLensPanel(QtWidgets.QWidget):
                 "color: #63d471; font-weight: 700;"
             )
             self.import_button.setToolTip(
-                "Import/re-import completed AutoLens result:\n" + path
+                "Create the camera, undistort/redistort lens nodes and all "
+                "geometry from this solve in the comp (formerly Import Result). "
+                "Safe to click again after editing surfaces.\n\n" + path
             )
         else:
             self.completed_result_checkbox.setStyleSheet(
@@ -1323,11 +1516,12 @@ class AutoLensPanel(QtWidgets.QWidget):
                 self.stage_label.setText("Ready")
                 self.stage_label.setStyleSheet("")
             self.import_button.setToolTip(
-                "Import becomes available when the current output folder "
-                "contains a completed AutoLens result."
+                "Create All becomes available once the selected solve version "
+                "holds a finished solve."
             )
 
         self._update_run_button_text()
+        self._update_step_indicator()
         return path
 
         self._set_completed_result_progress(
@@ -1344,34 +1538,76 @@ class AutoLensPanel(QtWidgets.QWidget):
         if not existing:
             return "overwrite"
 
+        current = self._selected_version()
+        new_index = self.version_combo.count() - 1
+        new_label = self.version_combo.itemText(new_index) if new_index >= 0 else ""
+        match = re.match(r"^Create New\s+\((v\d+)\)$", new_label, re.IGNORECASE)
+        new_version = match.group(1) if match else ""
+
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("AutoLens Result Already Exists")
         box.setIcon(QtWidgets.QMessageBox.Question)
         box.setText(
-            "The selected solve version already contains a completed AutoLens track."
+            f"{current} already holds a finished solve."
         )
         box.setInformativeText(
-            "Continue using this version with the currently-selected Run mode?\n\n"
-            "To start a clean new version, choose Create New in the Solve version dropdown."
+            (f"Solve as {new_version} to keep {current} untouched, or " if new_version else "")
+            + f"re-run {current} (Run mode: {self.run_mode.currentText()})."
         )
 
+        new_button = None
+        if new_version:
+            new_button = box.addButton(
+                f"Solve as New Version ({new_version})",
+                QtWidgets.QMessageBox.AcceptRole,
+            )
         reuse_button = box.addButton(
-            "Reuse Selected Version",
+            f"Re-run {current}",
             QtWidgets.QMessageBox.AcceptRole,
         )
-        cancel_button = box.addButton(
+        box.addButton(
             QtWidgets.QMessageBox.Cancel,
         )
 
+        # Re-running stays the default, as before: with Run mode Resume it reuses
+        # the cached stages, while a new version starts a full solve.
         box.setDefaultButton(reuse_button)
-        box.exec()
+        # Older PySide2 builds (Nuke 14) only have exec_().
+        (getattr(box, "exec_", None) or box.exec)()
 
+        clicked = box.clickedButton()
+        if new_button is not None and clicked is new_button:
+            # Selecting Create New syncs the controller via _version_changed.
+            self.version_combo.setCurrentIndex(new_index)
+            return "new"
         return (
             "overwrite"
-            if box.clickedButton() is reuse_button
+            if clicked is reuse_button
             else None
         )
 
+
+    def build_geometry(self):
+        """Build the dense mesh and surfaces for the selected solve, reusing its camera."""
+        if self.runner.is_running():
+            return
+        if not self._discover_result_path():
+            QtWidgets.QMessageBox.information(
+                self,
+                "AutoLens",
+                "There's no finished track in the selected solve version yet.\n\n"
+                "What to do: click Track first.",
+            )
+            return
+        self._geometry_run = True
+        # Set before starting, so the runner's started signal already sees it.
+        self.geometry_build_running = True
+        try:
+            self.run_autolens()
+        finally:
+            # run_autolens has built its arguments (or bailed out) by now.
+            self._geometry_run = False
+        self.geometry_build_running = self.runner.is_running()
 
     def run_autolens(self):
         if self.runner.is_running():
@@ -1380,10 +1616,14 @@ class AutoLensPanel(QtWidgets.QWidget):
         if not self._preflight_before_run():
             return
 
-        action = self._ask_existing_result_action()
+        action = "overwrite" if self._geometry_run else self._ask_existing_result_action()
         if action is None:
             return
 
+        # Everything from here to the engine starting is Nuke-side prep the
+        # artist waits for (plate proxy, mask and guide export).
+        prep_started = time.perf_counter()
+        self._run_kind = "geometry" if self._geometry_run else "track"
         output_folder = Path(
             self._resolved_output_folder()
         )
@@ -1408,16 +1648,23 @@ class AutoLensPanel(QtWidgets.QWidget):
         # result replaces it. This allows re-import even if a later run fails.
         self.import_button.setEnabled(False)
         self.progress.setValue(0)
+        self.last_failure = None
+        self._imported = False
         self.stage_label.setText("Starting AutoLens…")
         self.stage_label.setStyleSheet("")
+        self.last_prep_seconds = time.perf_counter() - prep_started
         self.runner.start(self.python_edit.text().strip() or "python", str(engine_path()), args)
 
     def _process_started(self):
         self.run_button.setEnabled(False)
         self.background_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
+        self._progress_timer.start()
+        self._update_step_indicator()
 
     def _process_finished(self, exit_code):
+        self.geometry_build_running = False
+        self._progress_timer.stop()
         self.run_button.setEnabled(True)
         self.background_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
@@ -1427,19 +1674,104 @@ class AutoLensPanel(QtWidgets.QWidget):
             self._remember_result_path(str(nk_path))
             self.restore_result_state()
             self._set_completed_result_progress(True)
+            self._save_run_timing(output)
 
             if self.import_when_done.isChecked():
                 try: self.import_last_result()
-                except Exception as exc: QtWidgets.QMessageBox.warning(self, "AutoLens Import", f"Solve completed, but result import failed:\n\n{exc}")
+                except Exception as exc: QtWidgets.QMessageBox.warning(self, "AutoLens Create All", f"The solve finished, but creating the result nodes failed:\n\n{exc}\n\nWhat to do: click Create All to try again.")
         elif exit_code != 0:
-            self.stage_label.setText("AutoLens stopped or failed")
-            self.restore_result_state()
-            QtWidgets.QMessageBox.warning(
-                self,
-                "AutoLens",
-                "AutoLens did not complete successfully.\n\n"
-                "Check the log for the last COLMAP message."
+            info = explain_failure(
+                self.runner.log_tail,
+                exit_code,
+                cancelled=self.runner.cancel_requested,
             )
+            self.last_failure = info
+            self.restore_result_state()
+            self._show_failure(info)
+            self._append_log(
+                f"\n[AUTOLENS] {info['title']}. What to do: {info['next_step']}\n"
+            )
+            if not self.runner.cancel_requested:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "AutoLens: " + info["title"],
+                    failure_message(info),
+                )
+        else:
+            self.restore_result_state()
+            self._show_failure({
+                "title": "Solve finished without a result file",
+                "reason": f"The engine exited cleanly but {nk_path.name} was not written.",
+                "next_step": "Check the log, then click Solve again (Resume reuses the finished stages).",
+                "detail": "",
+            })
+        self._update_step_indicator()
+
+    def _save_run_timing(self, output):
+        """Save and log how long the run took: Nuke prep + engine wall time."""
+        kind = getattr(self, "_run_kind", "track")
+        prep = float(getattr(self, "last_prep_seconds", 0.0) or 0.0)
+        engine = float(self.runner.estimator.elapsed())
+        path = Path(output) / UI_TIMING_FILE
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(saved, dict):
+                saved = {}
+        except Exception:
+            saved = {}
+        saved[kind] = ui_timing_payload(prep, engine, kind)
+        try:
+            path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self._append_log(f"\n[AUTOLENS] Could not save the run time: {exc}\n")
+        info = track_time(load_result(output), saved[kind])
+        self.last_run_timing = info
+        what = "Geometry build" if kind == "geometry" else "Track"
+        lines = [f"\n[AUTOLENS] {what} finished in {format_duration(prep + engine)} "
+                 f"(Nuke prep {format_duration(prep)}, engine {format_duration(engine)})."]
+        for name, text in timing_lines(info):
+            if name != "Total":
+                lines.append(f"[AUTOLENS TIMING]   {name}: {text}")
+        self._append_log("\n".join(lines) + "\n")
+
+    def _show_failure(self, info):
+        cancelled = info["title"] == "Solve cancelled"
+        self.stage_label.setText(
+            f"<b>{info['title']}</b><br>{info['next_step']}"
+        )
+        self.stage_label.setToolTip(failure_message(info))
+        self.stage_label.setStyleSheet(
+            "color: #e0b060;" if cancelled else "color: #e08080;"
+        )
+
+    def _update_step_indicator(self):
+        if not hasattr(self, "step_label"):
+            return
+        try:
+            running = self.runner.is_running()
+        except Exception:
+            running = False
+        source_text = self.source_edit.text().strip()
+        has_source = bool(source_text) and Path(source_text).is_dir()
+        step = current_step(
+            has_source=has_source,
+            installed=self._install_ready,
+            running=running,
+            has_result=bool(self.last_result_nk),
+            imported=self._imported,
+        )
+        self.step_label.setText(step_indicator_html(step))
+        if running:
+            hint = "Solving. You can keep working: click Background to hide this window."
+        elif self.last_failure and not self.last_result_nk:
+            hint = "Last solve: " + self.last_failure["title"] + ". " + self.last_failure["next_step"]
+        elif not has_source:
+            hint = step_hint(0)
+        elif not self._install_ready:
+            hint = "AutoLens is not installed yet: close Nuke, run install_autolens.bat, then reopen this window."
+        else:
+            hint = step_hint(step)
+        self.step_hint_label.setText(hint)
 
     def import_last_result(self):
         path = self._discover_result_path() or self.last_result_nk
@@ -1497,10 +1829,13 @@ class AutoLensPanel(QtWidgets.QWidget):
 
         self._remember_result_path(path)
         self.import_button.setEnabled(True)
+        self._imported = True
+        self._update_step_indicator()
 
         self._append_log(
-            f"\n[AUTOLENS] Imported {len(pasted)} result nodes into current comp.\n"
-            f"[AUTOLENS] Result remains available for re-import: {path}\n"
+            f"\n[AUTOLENS] Created {len(pasted)} result nodes in the comp "
+            "(camera, lens and geometry).\n"
+            f"[AUTOLENS] Click Create All again any time to re-create them from: {path}\n"
         )
 
     def _append_log(self, text):
@@ -1508,8 +1843,16 @@ class AutoLensPanel(QtWidgets.QWidget):
 
     def _progress_changed(self, percent, stage):
         self.progress.setValue(percent)
+        if not self.runner.is_running():
+            # Final Complete / Stopped update; _process_finished sets the text.
+            return
         self.stage_label.setStyleSheet("")
-        self.stage_label.setText(stage)
+        self.stage_label.setToolTip("")
+        self.stage_label.setText(self.runner.progress_text() or stage)
+
+    def _tick_progress(self):
+        if self.runner.is_running():
+            self.stage_label.setText(self.runner.progress_text())
 
 _REGISTERED = False
 

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Nuke
+*.nk~
+*.autosave
+*.nk.autosave
+
+# AutoLens runtime / install artefacts
+.managed_colmap/
+.miniforge3/
+.colmap_env/
+autolens_install.json
+AutoLens_Install_Report.txt
+autolens_settings.json
+
+# AutoLens solve outputs (never commit shot data)
+database.db
+database_global.db
+sparse/
+sparse_global/
+dense/
+tracking_masks/
+autolens_*.json
+autolens_*.obj
+autolens_*.ply
+autolens_*.exr
+AutoLens_v*.nk
+
+# Release packages. They aren't committed: the Release workflow builds the zip from each
+# release's commit and attaches it to the GitHub Release.
+dist/
+releases/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

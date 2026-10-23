@@ -22,6 +22,17 @@ def square_pixel_proxy_dimensions(width,height,pa,max_dimension):
     s=min(1.0,float(max_dimension)/max(dw,dh,1.0))
     return max(2,int(round(dw*s))), max(2,int(round(dh*s)))
 
+def clear_proxy_frames(proxy):
+    """Remove rendered frames and the manifest from a proxy folder about to be re-rendered.
+
+    The folder name holds only size and PAR, so a different plate or a longer range
+    can leave frames behind; the engine solves every image in the folder.
+    """
+    proxy=Path(proxy)
+    for stale in list(proxy.glob("frame.*.png"))+[proxy/'autolens_proxy_manifest.json']:
+        try: stale.unlink()
+        except OSError: pass
+
 def ensure_square_pixel_proxy(controller,source_read,output_folder,max_dimension,log=None):
     sf=source_format_info(source_read); pa=float(sf["pixel_aspect"])
     if abs(pa-1.0)<1e-6:
@@ -45,6 +56,7 @@ def ensure_square_pixel_proxy(controller,source_read,output_folder,max_dimension
     if existing==manifest and ff.exists() and lf.exists():
         if log: log(f"\n[AUTOLENS PAR] Reusing cached square-pixel solve proxy:\n  {proxy}\n")
         return {"images_dir":str(proxy),"source_format":sf,"created":False}
+    clear_proxy_frames(proxy)
     input_node=None
     if controller is not None:
         try: input_node=controller.input(0)

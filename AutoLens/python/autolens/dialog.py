@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import os
-import tempfile
-import uuid
+import time
 from pathlib import Path
 import re
 
@@ -15,7 +14,30 @@ except ImportError:
     from PySide2 import QtCore, QtGui, QtWidgets
     Signal = QtCore.Signal
 
-from . import __version__
+from . import __version__, icons, theme, ux
+from .frame_cache import (
+    PlaybackClock,
+    bucket_width,
+    cache_budget_bytes,
+    clamp_frame,
+    contiguous_runs,
+    nearest_cached,
+    playback_step,
+    prefetch_order,
+    step_frame,
+)
+from .frame_decode import WORKER_EXTS, transfer_for
+from .frame_server import FrameServerPool, managed_python
+from .plate_reader import ReadSnapshot, choose_pattern, upstream_note
+from .preview_loader import (
+    PreviewLoader,
+    decode_image,
+    supported_extensions,
+    worker_decoder,
+)
+from .build import version_text
+from .startup import defer_initial_preview, timed
+from .ux import timeline_tick_step as tick_step
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
 from .surface_guides import (
@@ -29,14 +51,18 @@ from .surface_guides import (
     clamp_frame_to_source,
     source_frame_range,
 )
+from .mask_cache import OverlayCache, fill_order
 from .tracking_masks import (
     mask_input_connected,
     mask_inverted,
+    mask_overlay_job,
+    mask_signature,
+    overlay_pixmap,
     set_mask_inverted,
-    render_mask_overlay_pixmap,
 )
 
 _DIALOGS = {}
+
 
 LEFT_BUTTON = getattr(
     QtCore.Qt,
@@ -60,6 +86,26 @@ ALIGN_CENTER = getattr(
 )
 
 
+NO_FOCUS = getattr(
+    QtCore.Qt,
+    "NoFocus",
+    getattr(getattr(QtCore.Qt, "FocusPolicy", object()), "NoFocus", 0),
+)
+CLICK_FOCUS = getattr(
+    QtCore.Qt,
+    "ClickFocus",
+    getattr(getattr(QtCore.Qt, "FocusPolicy", object()), "ClickFocus", 2),
+)
+PRECISE_TIMER = getattr(
+    QtCore.Qt,
+    "PreciseTimer",
+    getattr(getattr(QtCore.Qt, "TimerType", object()), "PreciseTimer", 0),
+)
+
+# Qt 5 (PySide2, Nuke 14/15) has QShortcut in QtWidgets; Qt 6 moved it to QtGui.
+QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
+
+
 WIDGET_WITH_CHILDREN_SHORTCUT = getattr(
     QtCore.Qt,
     "WidgetWithChildrenShortcut",
@@ -69,6 +115,136 @@ WIDGET_WITH_CHILDREN_SHORTCUT = getattr(
         3,
     ),
 )
+
+
+_HORIZONTAL = getattr(
+    QtCore.Qt,
+    "Horizontal",
+    getattr(getattr(QtCore.Qt, "Orientation", object()), "Horizontal", 1),
+)
+_ALIGN_RIGHT = getattr(
+    QtCore.Qt,
+    "AlignRight",
+    getattr(getattr(QtCore.Qt, "AlignmentFlag", object()), "AlignRight", 2),
+) | getattr(
+    QtCore.Qt,
+    "AlignVCenter",
+    getattr(getattr(QtCore.Qt, "AlignmentFlag", object()), "AlignVCenter", 0x80),
+)
+_NO_BUTTONS = getattr(
+    QtWidgets.QAbstractSpinBox,
+    "NoButtons",
+    getattr(getattr(QtWidgets.QAbstractSpinBox, "ButtonSymbols", object()), "NoButtons", 2),
+)
+_RICH_TEXT = getattr(
+    QtCore.Qt,
+    "RichText",
+    getattr(getattr(QtCore.Qt, "TextFormat", object()), "RichText", 1),
+)
+_SIZE_IGNORED = getattr(
+    QtWidgets.QSizePolicy,
+    "Ignored",
+    getattr(getattr(QtWidgets.QSizePolicy, "Policy", object()), "Ignored", 13),
+)
+_SIZE_PREFERRED = getattr(
+    QtWidgets.QSizePolicy,
+    "Preferred",
+    getattr(getattr(QtWidgets.QSizePolicy, "Policy", object()), "Preferred", 5),
+)
+
+_STEP_TIPS = {
+    "track": "Track: solve the camera and lens from the plate (mask moving objects first)",
+    "draw": "Draw: optional planes over flat surfaces, each with its own guide frame",
+    "output": "Output: Create All, single assets, and geometry status",
+}
+
+
+# Small builders for the Match-style workspace.
+def _frame(name):
+    f = QtWidgets.QFrame()
+    f.setObjectName(name)
+    return f
+
+
+def _hbox(parent, margins=(12, 0, 12, 0), spacing=6):
+    lay = QtWidgets.QHBoxLayout(parent)
+    lay.setContentsMargins(*margins)
+    lay.setSpacing(spacing)
+    return lay
+
+
+def _vbox(parent, margins=(12, 10, 12, 10), spacing=8):
+    lay = QtWidgets.QVBoxLayout(parent)
+    lay.setContentsMargins(*margins)
+    lay.setSpacing(spacing)
+    return lay
+
+
+def _label(text, name=None):
+    lab = QtWidgets.QLabel(text)
+    if name:
+        lab.setObjectName(name)
+    return lab
+
+
+def _wrap(label):
+    label.setWordWrap(True)
+    return label
+
+
+def _elide(label):
+    # Long text is cut off instead of widening the window.
+    label.setSizePolicy(_SIZE_IGNORED, _SIZE_PREFERRED)
+    return label
+
+
+def _separator():
+    s = _frame("Separator")
+    s.setFixedSize(1, 22)
+    return s
+
+
+def _icon_button(icon_name, tip, name="Tool", colour=None):
+    b = QtWidgets.QPushButton()
+    b.setObjectName(name)
+    b.setAutoDefault(False)
+    b.setIcon(icons.icon(icon_name, colour) if colour else icons.icon(icon_name))
+    b.setIconSize(icons.icon_size())
+    b.setToolTip(tip)
+    return b
+
+
+def _menu_button(text):
+    b = QtWidgets.QPushButton(text)
+    b.setObjectName("MenuBarButton")
+    b.setAutoDefault(False)
+    b.setFocusPolicy(NO_FOCUS)
+    m = QtWidgets.QMenu(b)
+    b.setMenu(m)
+    return b, m
+
+
+def _action(menu, text, slot, key=None, checkable=False, tip=""):
+    """Menu entry. `key` is only shown; the window's shortcuts do the work."""
+    a = menu.addAction(text + ("\t" + key if key else ""))
+    a.setCheckable(checkable)
+    if tip:
+        a.setToolTip(tip)
+        a.setStatusTip(tip)
+    a.triggered.connect(lambda *_: slot())
+    return a
+
+
+def _action_group(parent):
+    cls = getattr(QtWidgets, "QActionGroup", None) or QtGui.QActionGroup
+    group = cls(parent)
+    group.setExclusive(True)
+    return group
+
+
+def _repolish(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
 
 
 def _active_window():
@@ -115,11 +291,15 @@ class SurfaceCanvas(QtWidgets.QWidget):
 
     surfacesChanged = Signal(list)
     selectionChanged = Signal(int)
+    zoomChanged = Signal(float)
+    resized = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.setMouseTracking(True)
+        # Click focus so arrow keys reach the dialog's frame stepping.
+        self.setFocusPolicy(CLICK_FOCUS)
         self.setMinimumSize(600, 420)
 
         self.pixmap = QtGui.QPixmap()
@@ -147,16 +327,29 @@ class SurfaceCanvas(QtWidgets.QWidget):
     # Data
     # ------------------------------------------------------------------
     def set_image(self, pixmap, width, height, pixel_aspect=1.0):
+        # `pixmap` may be a viewer-sized proxy; width/height are the plate's
+        # real size, which surface coordinates use.
         self.pixmap = pixmap or QtGui.QPixmap()
-        self.image_width = max(1, int(width))
-        self.image_height = max(1, int(height))
+        width = max(1, int(width))
+        height = max(1, int(height))
         try:
             pa = float(pixel_aspect)
         except Exception:
             pa = 1.0
-        self.pixel_aspect = pa if pa > 0.0 else 1.0
-        self.zoom = 1.0
-        self.pan = QtCore.QPointF(0.0, 0.0)
+        pa = pa if pa > 0.0 else 1.0
+
+        # Keep zoom/pan while stepping or playing through the same plate.
+        if (width, height, pa) != (
+            self.image_width,
+            self.image_height,
+            self.pixel_aspect,
+        ):
+            self.zoom = 1.0
+            self.pan = QtCore.QPointF(0.0, 0.0)
+
+        self.image_width = width
+        self.image_height = height
+        self.pixel_aspect = pa
         self.update()
 
     def set_surfaces(
@@ -246,6 +439,10 @@ class SurfaceCanvas(QtWidgets.QWidget):
         self.show_mask_overlay = False
         self.update()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
+
     def fit_view(self):
         self.zoom = 1.0
         self.pan = QtCore.QPointF(0.0, 0.0)
@@ -302,7 +499,7 @@ class SurfaceCanvas(QtWidgets.QWidget):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QtGui.QColor(18, 18, 18))
+        painter.fillRect(self.rect(), QtGui.QColor(theme.BG_0))
 
         image_rect, _ = self._image_rect()
 
@@ -613,6 +810,7 @@ class SurfaceCanvas(QtWidgets.QWidget):
 
         self.zoom = new_zoom
         self.update()
+        self.zoomChanged.emit(float(new_zoom))
 
         try:
             event.accept()
@@ -624,6 +822,8 @@ class GuideTimeline(QtWidgets.QWidget):
     """Compact Mocha-style shot timeline with guide-frame markers."""
 
     frameChanged = Signal(int)
+    scrubStarted = Signal()
+    scrubFinished = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -631,9 +831,33 @@ class GuideTimeline(QtWidgets.QWidget):
         self.last_frame = 100
         self.current_frame = 1
         self.markers = []
-        self.setMinimumHeight(52)
-        self.setMaximumHeight(64)
+        # (start, end) runs: decoded in memory / rendered proxies on disk.
+        self.cached_ranges = []
+        self.disk_ranges = []
+        self.mask_ranges = []   # frames whose mask overlay is ready
+        self.scrubbing = False
+        self.setMinimumHeight(66)
+        self.setMaximumHeight(70)
         self.setMouseTracking(True)
+        self.setFocusPolicy(CLICK_FOCUS)
+
+    def set_cached_ranges(self, memory_ranges, disk_ranges=()):
+        memory_ranges = list(memory_ranges or [])
+        disk_ranges = list(disk_ranges or [])
+        if (
+            memory_ranges == self.cached_ranges
+            and disk_ranges == self.disk_ranges
+        ):
+            return
+        self.cached_ranges = memory_ranges
+        self.disk_ranges = disk_ranges
+        self.update()
+
+    def set_mask_ranges(self, ranges):
+        ranges = list(ranges or [])
+        if ranges != self.mask_ranges:
+            self.mask_ranges = ranges
+            self.update()
 
     def set_range(self, first_frame, last_frame):
         self.first_frame = int(first_frame)
@@ -674,11 +898,17 @@ class GuideTimeline(QtWidgets.QWidget):
         })
         self.update()
 
+    # Lane layout: labels in a left gutter, as in Match's timeline.
+    GUTTER = 64
+    RIGHT_PAD = 14
+    RULER_Y = 16
+    LANES = (("Guides", 30), ("Mask", 44), ("Cache", 56))
+
     def _x_for_frame(self, frame):
-        left = 12.0
+        left = float(self.GUTTER)
         right = max(
             left + 1.0,
-            float(self.width()) - 12.0,
+            float(self.width()) - self.RIGHT_PAD,
         )
         span = max(
             1,
@@ -691,10 +921,10 @@ class GuideTimeline(QtWidgets.QWidget):
         return left + t * (right - left)
 
     def _frame_for_x(self, x):
-        left = 12.0
+        left = float(self.GUTTER)
         right = max(
             left + 1.0,
-            float(self.width()) - 12.0,
+            float(self.width()) - self.RIGHT_PAD,
         )
         t = (
             float(x) - left
@@ -720,143 +950,77 @@ class GuideTimeline(QtWidgets.QWidget):
             QtGui.QPainter.Antialiasing,
             False,
         )
+        painter.fillRect(self.rect(), QtGui.QColor(theme.BG_1))
 
-        painter.fillRect(
-            self.rect(),
-            QtGui.QColor(31, 31, 31),
-        )
+        left = self.GUTTER
+        right = self.width() - self.RIGHT_PAD
+        height = self.height()
+        line = QtGui.QColor(theme.LINE)
+        faint = QtGui.QColor(theme.TEXT_FAINT)
+        dim = QtGui.QColor(theme.TEXT_DIM)
+        font = painter.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.85))
+        painter.setFont(font)
 
-        y = 18
-        left = 12
-        right = self.width() - 12
+        # Ruler: a thin line with labelled ticks at a readable spacing.
+        frame_count = max(1, self.last_frame - self.first_frame)
+        step = tick_step(frame_count, max(1, right - left))
+        painter.setPen(QtGui.QPen(QtGui.QColor(theme.CACHE_DISK), 1))
+        painter.drawLine(left, self.RULER_Y + 4, right, self.RULER_Y + 4)
+        first_tick = ((self.first_frame + step - 1) // step) * step
+        for frame in range(first_tick, self.last_frame + 1, step):
+            x = int(round(self._x_for_frame(frame)))
+            painter.setPen(line)
+            painter.drawLine(x, self.RULER_Y + 6, x, height)
+            painter.setPen(faint)
+            painter.drawText(x + 3, self.RULER_Y, str(frame))
 
-        painter.setPen(
-            QtGui.QPen(
-                QtGui.QColor(90, 90, 90),
-                1,
-            )
-        )
-        painter.drawLine(
-            left,
-            y,
-            right,
-            y,
-        )
+        # Lane labels and separators.
+        for text, y in self.LANES:
+            painter.setPen(dim)
+            painter.drawText(10, y + 4, text)
 
-        frame_count = max(
-            1,
-            self.last_frame - self.first_frame + 1,
-        )
-
-        # Keep tick density readable while preserving the Mocha-like feel.
-        tick_step = max(
-            1,
-            int(
-                frame_count / max(
-                    1,
-                    self.width() // 10,
-                )
-            ),
-        )
-
-        painter.setPen(
-            QtGui.QColor(150, 150, 150)
-        )
-
-        for frame in range(
-            self.first_frame,
-            self.last_frame + 1,
-            tick_step,
-        ):
-            x = int(
-                round(
-                    self._x_for_frame(
-                        frame
-                    )
-                )
-            )
-            painter.drawLine(
-                x,
-                y - 5,
-                x,
-                y + 5,
-            )
-
-        # Guided frames = blue marks.
-        painter.setPen(
-            QtGui.QPen(
-                QtGui.QColor(55, 145, 255),
-                3,
-            )
-        )
-
+        # Guides lane: one mark per surface guide frame.
+        guide_y = self.LANES[0][1]
+        guide = QtGui.QColor(theme.GUIDE)
         for frame in self.markers:
-            x = int(
-                round(
-                    self._x_for_frame(
-                        frame
-                    )
-                )
-            )
-            painter.drawLine(
-                x,
-                y - 10,
-                x,
-                y + 11,
-            )
+            x = int(round(self._x_for_frame(frame)))
+            painter.fillRect(x - 2, guide_y - 6, 5, 12, guide)
 
-        # Current frame = warm playhead.
-        current_x = int(
-            round(
-                self._x_for_frame(
-                    self.current_frame
-                )
-            )
-        )
+        # Mask lane: frames whose tracking-mask overlay is ready to play.
+        mask_y = self.LANES[1][1]
+        painter.fillRect(left, mask_y - 1, max(1, right - left), 3, QtGui.QColor("#1a1d21"))
+        for start, end in self.mask_ranges:
+            x0 = max(left, int(round(self._x_for_frame(start - 0.5))))
+            x1 = min(right, int(round(self._x_for_frame(end + 0.5))))
+            if x1 >= x0:
+                painter.fillRect(x0, mask_y - 1, max(1, x1 - x0), 3, QtGui.QColor(theme.MASK))
 
-        painter.setPen(
-            QtGui.QPen(
-                QtGui.QColor(255, 145, 45),
-                2,
-            )
-        )
-        painter.drawLine(
-            current_x,
-            4,
-            current_x,
-            self.height() - 5,
-        )
+        # Cache lane: dark = proxy rendered to disk, bright = decoded in memory.
+        cache_y = self.LANES[2][1]
+        painter.fillRect(left, cache_y - 1, max(1, right - left), 3, QtGui.QColor("#1a1d21"))
+        for ranges, color in (
+            (self.disk_ranges, QtGui.QColor(theme.CACHE_DISK)),
+            (self.cached_ranges, QtGui.QColor(theme.CACHE)),
+        ):
+            for start, end in ranges:
+                x0 = max(left, int(round(self._x_for_frame(start - 0.5))))
+                x1 = min(right, int(round(self._x_for_frame(end + 0.5))))
+                if x1 >= x0:
+                    painter.fillRect(x0, cache_y - 1, max(1, x1 - x0), 3, color)
 
-        painter.setPen(
-            QtGui.QColor(80, 170, 255)
-        )
-        painter.drawText(
-            QtCore.QRect(
-                10,
-                31,
-                95,
-                18,
-            ),
-            f"{self.current_frame}",
-        )
-
-        painter.setPen(
-            QtGui.QColor(120, 120, 120)
-        )
-        painter.drawText(
-            QtCore.QRect(
-                self.width() - 180,
-                31,
-                168,
-                18,
-            ),
-            getattr(
-                QtCore.Qt,
-                "AlignRight",
-                0x0002,
-            ),
-            f"{self.first_frame} — {self.last_frame}",
-        )
+        # Playhead.
+        current_x = int(round(self._x_for_frame(self.current_frame)))
+        painter.setPen(QtGui.QPen(QtGui.QColor(theme.PLAYHEAD), 2))
+        painter.drawLine(current_x, self.RULER_Y + 2, current_x, height - 2)
+        painter.setBrush(QtGui.QColor(theme.PLAYHEAD))
+        painter.setPen(QtCore.Qt.NoPen if hasattr(QtCore.Qt, "NoPen") else QtCore.Qt.PenStyle.NoPen)
+        painter.drawPolygon(QtGui.QPolygon([
+            QtCore.QPoint(current_x - 5, self.RULER_Y - 4),
+            QtCore.QPoint(current_x + 5, self.RULER_Y - 4),
+            QtCore.QPoint(current_x, self.RULER_Y + 3),
+        ]))
+        painter.end()
 
     def mousePressEvent(self, event):
         pos = (
@@ -867,6 +1031,8 @@ class GuideTimeline(QtWidgets.QWidget):
         frame = self._frame_for_x(
             pos.x()
         )
+        self.scrubbing = True
+        self.scrubStarted.emit()
         self.set_current_frame(frame)
         self.frameChanged.emit(frame)
 
@@ -881,8 +1047,16 @@ class GuideTimeline(QtWidgets.QWidget):
             frame = self._frame_for_x(
                 pos.x()
             )
+            # Many mouse moves land on the same frame; only report changes.
+            if frame == self.current_frame:
+                return
             self.set_current_frame(frame)
             self.frameChanged.emit(frame)
+
+    def mouseReleaseEvent(self, event):
+        if self.scrubbing:
+            self.scrubbing = False
+            self.scrubFinished.emit(int(self.current_frame))
 
 
 class AutoLensBackgroundMonitor(QtWidgets.QDialog):
@@ -897,7 +1071,7 @@ class AutoLensBackgroundMonitor(QtWidgets.QDialog):
         self.owner = owner
 
         self.setWindowTitle(
-            f"AutoLens {__version__} - DeadCow VFX"
+            f"AutoLens {version_text(__version__)} - DeadCow VFX"
         )
 
         try:
@@ -930,7 +1104,7 @@ class AutoLensBackgroundMonitor(QtWidgets.QDialog):
         title_row = QtWidgets.QHBoxLayout()
 
         self.title_label = QtWidgets.QLabel(
-            f"<b>AutoLens {__version__}</b>"
+            f"<b>AutoLens {version_text(__version__)}</b>"
         )
         self.node_label = QtWidgets.QLabel(
             owner.controller_node.name()
@@ -1093,7 +1267,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._syncing_list = False
 
         self.setWindowTitle(
-            f"AutoLens {__version__} - DeadCow VFX"
+            f"AutoLens {version_text(__version__)} - DeadCow VFX"
         )
         self.background_monitor = None
 
@@ -1103,16 +1277,22 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
         self.setMinimumSize(900, 620)
 
-        self._build_ui()
-        self._install_shortcuts()
-        self._construct_panel()
-        self._load_node_settings(self.read_node)
+        with timed("dialog: build UI"):
+            self._build_ui()
+            self._install_shortcuts()
+        with timed("dialog: build Solve panel"):
+            self._construct_panel()
+        with timed("dialog: load node settings"):
+            self._load_node_settings(self.read_node)
         self._wire_node_sync()
+        self._set_step("track")
 
-        self._load_preview()
-        self._reload_surfaces()
-        self._reload_masks()
-        self._refresh_timeline()
+        # The plate preview can mean a Nuke render (EXR, TIFF), so by default
+        # it loads on the first event-loop turn after the window is shown.
+        # AUTOLENS_DEFER_PREVIEW=0 loads it here, before the window appears.
+        self._initial_load_done = False
+        if not defer_initial_preview():
+            self._initial_load()
 
         # AutoLens is designed as a full workspace, not a utility popup.
         # Give it a sensible fallback size here; show_autolens_dialog() opens it
@@ -1127,202 +1307,296 @@ class AutoLensDialog(QtWidgets.QDialog):
         else:
             self.resize(1440, 900)
 
+    def _initial_load(self):
+        """Plate preview, surfaces, masks and timeline. Runs once."""
+        if self._initial_load_done:
+            return
+        self._initial_load_done = True
+
+        with timed("dialog: preview, surfaces, masks, timeline"):
+            self._load_preview()
+            self._reload_surfaces()
+            self._reload_masks()
+            self._refresh_timeline()
+            # The workspace opens on Track: show the mask overlay there.
+            self._sidebar_tab_changed(self.sidebar.currentIndex())
+            self._refresh_workflow()
+
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
     def _build_ui(self):
-        self.setStyleSheet("""
-            QDialog { background: #252525; color: #d7d7d7; }
-            QGroupBox {
-                border: 1px solid #454545;
-                border-radius: 3px;
-                margin-top: 8px;
-                padding-top: 8px;
-            }
-            QTabWidget::pane { border: 1px solid #454545; }
-            QTabBar::tab {
-                background: #303030;
-                border: 1px solid #454545;
-                padding: 7px 13px;
-            }
-            QTabBar::tab:selected { background: #454545; }
-            QPushButton { min-height: 25px; }
-            QListWidget { background: #1f1f1f; border: 1px solid #444; }
-        """)
+        """
+        Match-style workspace:
+
+          top bar      brand · menus · shot breadcrumb · Track › Draw › Output
+          middle       viewer (status chip, frame) | panel for the current step
+          bottom       transport + Track / Stop, then the timeline lanes
+          status bar   what to do next | last message
+
+        The panel only shows the current step. Everything else is in a menu,
+        the quality popover or Solve settings.
+        """
+        self.setObjectName("AutoLensWorkspace")
+        self.setStyleSheet(theme.STYLESHEET)
+        self._step = "track"
+        self._result_cache = (None, None, {})
+        self._last_percent = 0
 
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(5)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # Toolbar
-        toolbar = QtWidgets.QHBoxLayout()
+        # -- top bar: brand, menus, shot, workflow --------------------------
+        top = _frame("TopBar")
+        top.setFixedHeight(46)
+        tl = _hbox(top, (14, 0, 12, 0), 4)
+        tl.addWidget(_label("AUTOLENS", "Brand"))
+        tl.addSpacing(12)
+        file_btn, self.file_menu = _menu_button("File")
+        track_btn, self.track_menu = _menu_button("Track")
+        draw_btn, self.draw_menu = _menu_button("Draw")
+        output_btn, self.output_menu = _menu_button("Output")
+        view_btn, self.view_menu = _menu_button("View")
+        for b in (file_btn, track_btn, draw_btn, output_btn, view_btn):
+            tl.addWidget(b)
+        tl.addSpacing(10)
+        tl.addWidget(_separator())
+        tl.addSpacing(10)
+        self.shot_label = _elide(_label("No plate", "ShotInfo"))
+        tl.addWidget(self.shot_label, 1)
 
-        title = QtWidgets.QLabel(
-            f"<b>AutoLens</b> "
-            f"<span style='color:#8d8d8d;'>v{__version__}</span> "
-            f"<span style='color:#666666;'>• DeadCow VFX</span>"
-        )
-        title.setStyleSheet("font-size: 14px;")
-        toolbar.addWidget(title)
+        self.step_buttons = {}
+        for index, (key, text) in enumerate(ux.WORKSPACE_STEPS):
+            if index:
+                tl.addWidget(_label("›", "StepArrow"))
+            b = QtWidgets.QPushButton(text)
+            b.setObjectName("Step")
+            b.setAutoDefault(False)
+            b.setFocusPolicy(NO_FOCUS)
+            b.setToolTip(_STEP_TIPS[key])
+            b.clicked.connect(lambda _c=False, k=key: self._set_step(k))
+            self.step_buttons[key] = b
+            tl.addWidget(b)
+        root.addWidget(top)
 
-        toolbar.addSpacing(12)
-
-        self.frame_label = QtWidgets.QLabel(f"Frame {int(nuke.frame())}")
-        toolbar.addWidget(self.frame_label)
-
-        toolbar.addStretch(1)
-
-        self.fit_button = QtWidgets.QPushButton("Fit")
-        toolbar.addWidget(self.fit_button)
-
-        root.addLayout(toolbar)
-
-        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        root.addWidget(self.main_splitter, 1)
-
-        # Left: viewer
-        viewer_frame = QtWidgets.QFrame()
+        # -- viewer: status chip and frame over the plate --------------------
+        viewer_frame = QtWidgets.QWidget()
+        viewer_frame.setStyleSheet(f"background: {theme.BG_0};")
         viewer_layout = QtWidgets.QVBoxLayout(viewer_frame)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
-
+        viewer_layout.setSpacing(0)
+        header = QtWidgets.QWidget()
+        hl = _hbox(header, (12, 6, 8, 4), 8)
+        self.chip = QtWidgets.QLabel("NOT SOLVED")
+        self.chip.setObjectName("Chip")
+        self.chip.setStyleSheet(theme.chip_style("none"))
+        self.chip.setToolTip(
+            "Track status. After a track it shows the mean reprojection error: "
+            "under about 1 px is a good solve."
+        )
+        hl.addWidget(self.chip)
+        hl.addStretch(1)
+        self.frame_label = _label(f"Frame {int(nuke.frame())}", "Faint")
+        hl.addWidget(self.frame_label)
+        self.fit_button = _icon_button("fit", "Fit the plate to the viewer (F)", name="Tool")
+        hl.addWidget(self.fit_button)
+        viewer_layout.addWidget(header)
         self.canvas = SurfaceCanvas()
         viewer_layout.addWidget(self.canvas, 1)
 
-        self.timeline = GuideTimeline()
-        viewer_layout.addWidget(self.timeline)
+        # -- side panel: one page per step -----------------------------------
+        side = _frame("SidePanel")
+        side_layout = _vbox(side, (14, 12, 14, 12), 10)
+        self.sidebar = QtWidgets.QStackedWidget()
+        side_layout.addWidget(self.sidebar, 1)
 
-        viewer_help = QtWidgets.QLabel(
-            "Drag surface corners directly in this viewer.  "
-            "Timeline: click/drag frame  •  Blue = surface guide frame  •  "
-            "F: fit  •  Mouse wheel: zoom  •  Middle-drag: pan"
-        )
-        viewer_help.setStyleSheet("color: #888; padding: 3px;")
-        viewer_layout.addWidget(viewer_help)
-
-        self.main_splitter.addWidget(viewer_frame)
-
-        # Right: tab sidebar
-        sidebar = QtWidgets.QTabWidget()
-        self.sidebar = sidebar
-        sidebar.setMinimumWidth(390)
-        sidebar.setMaximumWidth(560)
-
-        # Surfaces tab
-        surfaces_tab = QtWidgets.QWidget()
-        sl = QtWidgets.QVBoxLayout(surfaces_tab)
-        sl.setContentsMargins(8, 8, 8, 8)
-
-        self.surface_list = QtWidgets.QListWidget()
-        sl.addWidget(self.surface_list, 1)
-
-        name_row = QtWidgets.QHBoxLayout()
-        self.surface_name_edit = QtWidgets.QLineEdit()
-        self.rename_button = QtWidgets.QPushButton("Rename")
-        name_row.addWidget(self.surface_name_edit, 1)
-        name_row.addWidget(self.rename_button)
-        sl.addLayout(name_row)
-
-        row = QtWidgets.QHBoxLayout()
-        self.surface_auto_button = QtWidgets.QPushButton("Auto Suggest")
-        self.surface_add_button = QtWidgets.QPushButton("Add Plane")
-        row.addWidget(self.surface_auto_button)
-        row.addWidget(self.surface_add_button)
-        sl.addLayout(row)
-
-        row2 = QtWidgets.QHBoxLayout()
-        self.surface_delete_button = QtWidgets.QPushButton("Delete")
-        self.guide_frame_button = QtWidgets.QPushButton("Set Guide Frame")
-        row2.addWidget(self.surface_delete_button)
-        row2.addWidget(self.guide_frame_button)
-        sl.addLayout(row2)
-
-        self.surface_status = QtWidgets.QLabel(
-            "Each surface can have its own guide frame. Green = its guide frame; gray = another frame."
-        )
-        self.surface_status.setWordWrap(True)
-        self.surface_status.setStyleSheet("color: #999;")
-        sl.addWidget(self.surface_status)
-
-        sidebar.addTab(surfaces_tab, "Surfaces")
-
-        # Masks tab
-        masks_tab = QtWidgets.QWidget()
-        ml = QtWidgets.QVBoxLayout(masks_tab)
-        ml.setContentsMargins(10, 10, 10, 10)
-
-        mask_title = QtWidgets.QLabel(
-            "<b>Tracking Mask Input</b>"
-        )
-        ml.addWidget(mask_title)
-
-        mask_help = QtWidgets.QLabel(
-            "Connect an alpha/matte to AutoLens input 2. "
-            "The viewer shows the tracking exclusion region as 20% red. "
-            "By default alpha marks areas AutoLens should AVOID while tracking."
-        )
-        mask_help.setWordWrap(True)
-        mask_help.setStyleSheet("color: #aaa;")
-        ml.addWidget(mask_help)
-
-        self.mask_connection_status = QtWidgets.QLabel(
-            "No mask connected."
-        )
-        self.mask_connection_status.setWordWrap(True)
-        ml.addWidget(self.mask_connection_status)
-
-        self.mask_mode_label = QtWidgets.QLabel(
-            "Alpha meaning: AVOID / EXCLUDE"
-        )
-        self.mask_mode_label.setStyleSheet(
-            "color: #e18aa9; font-weight: 600;"
-        )
-        ml.addWidget(self.mask_mode_label)
-
-        self.mask_invert_button = QtWidgets.QPushButton(
-            "Invert"
-        )
+        # Track ---------------------------------------------------------------
+        track_page = QtWidgets.QWidget()
+        tp = _vbox(track_page, (0, 0, 0, 0), 8)
+        tp.addWidget(_label("TRACK", "Section"))
+        self.track_info = _wrap(_label("", "Dim"))
+        tp.addWidget(self.track_info)
+        self.track_row = QtWidgets.QHBoxLayout()
+        self.track_row.setSpacing(6)
+        tp.addLayout(self.track_row)   # Track button + quality popover, see _construct_panel
+        self.track_status_layout = QtWidgets.QVBoxLayout()
+        self.track_status_layout.setSpacing(6)
+        tp.addLayout(self.track_status_layout)  # progress, stage and Cancel
+        tp.addSpacing(10)
+        tp.addWidget(_label("TRACKING MASK", "Section"))
+        self.mask_connection_status = _wrap(_label("No mask connected.", "Dim"))
+        tp.addWidget(self.mask_connection_status)
+        mask_row = QtWidgets.QHBoxLayout()
+        self.mask_mode_label = _label("Alpha meaning: AVOID", "Dim")
+        mask_row.addWidget(self.mask_mode_label, 1)
+        self.mask_invert_button = QtWidgets.QPushButton("Invert")
+        self.mask_invert_button.setObjectName("Toggle")
         self.mask_invert_button.setCheckable(True)
+        self.mask_invert_button.setAutoDefault(False)
         self.mask_invert_button.setToolTip(
-            "Swap whether alpha means Avoid/Exclude or Keep/Track."
+            "Swap whether the mask's alpha means Avoid (default) or Keep. "
+            "The red overlay always shows what tracking will avoid."
         )
-        ml.addWidget(self.mask_invert_button)
+        mask_row.addWidget(self.mask_invert_button)
+        tp.addLayout(mask_row)
+        tp.addWidget(_wrap(_label(
+            "Optional: connect a matte to the TrackingMask input to keep moving "
+            "people, cars or reflections out of the track.",
+            "Faint",
+        )))
+        tp.addStretch(1)
+        self.masks_tab_index = self.sidebar.addWidget(track_page)
 
-        mask_preview_note = QtWidgets.QLabel(
-            "Viewer overlay: 20% red always shows what AutoLens will AVOID."
+        # Draw ----------------------------------------------------------------
+        draw_page = QtWidgets.QWidget()
+        dp = _vbox(draw_page, (0, 0, 0, 0), 8)
+        dp.addWidget(_label("SURFACES", "Section"))
+        self.draw_info = _wrap(_label("", "Dim"))
+        dp.addWidget(self.draw_info)
+        tools = QtWidgets.QHBoxLayout()
+        tools.setSpacing(4)
+        self.surface_add_button = _icon_button(
+            "plane", "Add plane (P): drag its four corners onto a flat surface", name="Tool")
+        self.surface_auto_button = _icon_button(
+            "wand", "Auto suggest: guess floor, wall and object planes on this frame", name="Tool")
+        self.guide_frame_button = _icon_button(
+            "flag", "Set guide frame (G): the selected surface was drawn on this frame", name="Tool")
+        self.surface_delete_button = _icon_button(
+            "trash", "Delete the selected surface (Del)", name="Tool")
+        for b in (self.surface_add_button, self.surface_auto_button, self.guide_frame_button):
+            tools.addWidget(b)
+        tools.addStretch(1)
+        tools.addWidget(self.surface_delete_button)
+        dp.addLayout(tools)
+        self.surface_list = QtWidgets.QListWidget()
+        self.surface_list.setToolTip("Surfaces sent to the track. Select one to edit it in the viewer.")
+        dp.addWidget(self.surface_list, 1)
+        self.surface_name_edit = QtWidgets.QLineEdit()
+        self.surface_name_edit.setPlaceholderText("Surface name")
+        self.surface_name_edit.setToolTip(
+            "Name of the selected surface; press Enter to rename. Its ReadGeo uses this name."
         )
-        mask_preview_note.setStyleSheet(
-            "color: #888;"
+        dp.addWidget(self.surface_name_edit)
+        # Renaming happens on Enter; the button stays for code that clicks it.
+        self.rename_button = QtWidgets.QPushButton("Rename")
+        self.rename_button.hide()
+        self.surface_status = _wrap(_label(
+            "Green: you're on the surface's guide frame. Grey: another frame.", "Faint"))
+        dp.addWidget(self.surface_status)
+        self.sidebar.addWidget(draw_page)
+
+        # Output --------------------------------------------------------------
+        output_page = QtWidgets.QWidget()
+        op = _vbox(output_page, (0, 0, 0, 0), 8)
+        op.addWidget(_label("OUTPUT", "Section"))
+        self.output_info = _wrap(_label("", "Dim"))
+        op.addWidget(self.output_info)
+        self.output_create_layout = QtWidgets.QVBoxLayout()
+        self.output_create_layout.setSpacing(6)
+        op.addLayout(self.output_create_layout)   # Create All, see _construct_panel
+        create_row = QtWidgets.QHBoxLayout()
+        self.create_one_button = QtWidgets.QPushButton("Create one")
+        self.create_one_button.setObjectName("MenuButton")
+        self.create_one_button.setAutoDefault(False)
+        self.create_one_button.setToolTip(
+            "Create a single asset from the solve: the camera, undistort, redistort, "
+            "a mesh, or one guided surface"
         )
-        mask_preview_note.setWordWrap(True)
-        ml.addWidget(mask_preview_note)
-
-        ml.addStretch(1)
-
-        self.masks_tab_index = sidebar.addTab(
-            masks_tab,
-            "Masks",
+        self.create_one_menu = QtWidgets.QMenu(self.create_one_button)
+        self.create_one_menu.aboutToShow.connect(
+            lambda: self._fill_create_menu(self.create_one_menu))
+        self.create_one_button.setMenu(self.create_one_menu)
+        create_row.addWidget(self.create_one_button, 1)
+        self.reveal_output_button = _icon_button(
+            "folder", "Open the solve version's folder", name="Tool")
+        create_row.addWidget(self.reveal_output_button)
+        op.addLayout(create_row)
+        op.addSpacing(10)
+        op.addWidget(_label("GEOMETRY", "Section"))
+        card = _frame("Card")
+        cl = _vbox(card, (10, 8, 10, 8), 4)
+        self.geometry_rows = []
+        for _key, text in ux.GEOMETRY_ITEMS:
+            row = QtWidgets.QHBoxLayout()
+            name = _label(text, "Dim")
+            state = _label("—", "Faint")
+            row.addWidget(name, 1)
+            row.addWidget(state)
+            cl.addLayout(row)
+            self.geometry_rows.append(state)
+        op.addWidget(card)
+        self.geometry_detail = _wrap(_label("", "Faint"))
+        self.geometry_detail.hide()
+        op.addWidget(self.geometry_detail)
+        self.build_geometry_button = QtWidgets.QPushButton("  Build geometry")
+        self.build_geometry_button.setIcon(icons.icon("cube"))
+        self.build_geometry_button.setIconSize(icons.icon_size())
+        self.build_geometry_button.setAutoDefault(False)
+        self.build_geometry_button.setToolTip(
+            "Build the dense mesh, mesh-fit planes and guided surfaces for this solve. "
+            "Reuses the tracked camera, so only the geometry stages run."
         )
-        # Solve tab placeholder; panel is installed after construction.
-        self.solve_tab = QtWidgets.QWidget()
-        self.solve_layout = QtWidgets.QVBoxLayout(self.solve_tab)
-        self.solve_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar.addTab(self.solve_tab, "Solve")
+        op.addWidget(self.build_geometry_button)
+        op.addSpacing(6)
+        self.timing_toggle = QtWidgets.QPushButton("Timing \u25b8")
+        self.timing_toggle.setObjectName("Disclosure")
+        self.timing_toggle.setCheckable(True)
+        self.timing_toggle.setAutoDefault(False)
+        self.timing_toggle.setToolTip("How long the last track took, stage by stage")
+        op.addWidget(self.timing_toggle)
+        self.timing_label = _wrap(_label("", "Dim"))
+        self.timing_label.setTextFormat(_RICH_TEXT)
+        self.timing_label.hide()
+        op.addWidget(self.timing_label)
+        self.timing_toggle.toggled.connect(self._timing_toggled)
+        op.addStretch(1)
+        self.sidebar.addWidget(output_page)
 
-        # The right properties area should remain comfortably readable at full
-        # screen, especially on 1440p/4K displays.
-        sidebar.setMinimumWidth(460)
-        sidebar.setMaximumWidth(680)
+        self.settings_toggle = QtWidgets.QPushButton("Solve settings…")
+        self.settings_toggle.setObjectName("Disclosure")
+        self.settings_toggle.setAutoDefault(False)
+        self.settings_toggle.setToolTip(
+            "Plate and output folders, solve version, quality, run mode, GPU and "
+            "dense settings, and the installation status"
+        )
+        side_layout.addWidget(self.settings_toggle)
 
-        self.main_splitter.addWidget(sidebar)
+        side.setMinimumWidth(260)
+        side.setMaximumWidth(440)
+        self.main_splitter = QtWidgets.QSplitter(_HORIZONTAL)
+        self.main_splitter.setHandleWidth(3)
+        self.main_splitter.addWidget(viewer_frame)
+        self.main_splitter.addWidget(side)
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
-        self.main_splitter.setCollapsible(1, False)
-        self.main_splitter.setSizes([1100, 500])
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setSizes([1300, 300])
+        root.addWidget(self.main_splitter, 1)
 
-        # Bottom status.
-        self.workspace_status = QtWidgets.QLabel("Ready")
-        self.workspace_status.setStyleSheet("color: #aaa; padding: 2px 4px;")
-        root.addWidget(self.workspace_status)
+        # -- bottom: transport with Track / Stop, then the timeline ----------
+        bottom = _frame("BottomBar")
+        bottom_layout = _vbox(bottom, (0, 0, 0, 0), 0)
+        self.timeline = GuideTimeline()
+        self._build_playback_bar(bottom_layout)
+        timeline_row = QtWidgets.QHBoxLayout()
+        timeline_row.setContentsMargins(0, 0, 10, 6)
+        timeline_row.addWidget(self.timeline, 1)
+        bottom_layout.addLayout(timeline_row)
+        root.addWidget(bottom)
+
+        # -- status bar: what to do next | last message ---------------------
+        status = _frame("StatusBar")
+        status.setFixedHeight(26)
+        sb = _hbox(status, (12, 0, 12, 0), 18)
+        self.hint_label = _elide(_label("", "Hint"))
+        sb.addWidget(self.hint_label, 3)
+        self.workspace_status = _elide(_label("Ready", "Faint"))
+        self.workspace_status.setAlignment(_ALIGN_RIGHT)
+        sb.addWidget(self.workspace_status, 2)
+        root.addWidget(status)
+
+        self._build_menus()
 
         # Wiring for workspace.
         self.fit_button.clicked.connect(self.canvas.fit_view)
@@ -1331,9 +1605,12 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.surface_delete_button.clicked.connect(self._delete_surface)
         self.guide_frame_button.clicked.connect(self._set_guide_frame)
         self.rename_button.clicked.connect(self._rename_surface)
+        self.surface_name_edit.returnPressed.connect(self._rename_surface)
         self.surface_list.currentRowChanged.connect(self._surface_list_changed)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.surfacesChanged.connect(self._canvas_surfaces_changed)
+        self.reveal_output_button.clicked.connect(self._reveal_output)
+        self.build_geometry_button.clicked.connect(lambda: self.panel.build_geometry())
 
         self.timeline.frameChanged.connect(
             self._timeline_frame_changed
@@ -1345,8 +1622,74 @@ class AutoLensDialog(QtWidgets.QDialog):
             self._mask_invert_toggled
         )
 
+    def _build_menus(self):
+        """Every action, including the ones without a button on screen."""
+        m = self.file_menu
+        _action(m, "Solve settings…", lambda: self._show_settings())
+        _action(m, "Open output folder", self._reveal_output)
+        m.addSeparator()
+        _action(m, "Installation status…", lambda: self.panel.check_environment())
+        _action(m, "Open install report", lambda: self.panel._open_install_report())
+        m.addSeparator()
+        _action(m, "Close", self.close)
+
+        m = self.track_menu
+        self.track_action = _action(m, "Track", lambda: self._track(), "T",
+                                    tip="Solve the camera and lens from the plate")
+        self.cancel_action = _action(m, "Stop tracking", lambda: self.panel.runner.cancel())
+        self.background_action = _action(
+            m, "Continue in background", lambda: self.panel.background_requested.emit(),
+            tip="Hide the workspace and keep tracking with a small progress window")
+        m.addSeparator()
+        self.invert_action = _action(m, "Invert tracking mask", lambda: self.mask_invert_button.toggle(),
+                                     checkable=True)
+        _action(m, "Refresh mask preview", lambda: self._refresh_mask_preview(clear=True),
+                tip="Sample the mask overlay again for every frame")
+        m.aboutToShow.connect(self._sync_track_menu)
+
+        m = self.draw_menu
+        _action(m, "Add plane", self._add_surface, "P")
+        _action(m, "Auto suggest planes", self._auto_suggest)
+        _action(m, "Set guide frame", self._set_guide_frame, "G")
+        _action(m, "Delete surface", self._delete_surface, "Del")
+        m.addSeparator()
+        self.use_guides_action = _action(
+            m, "Use surfaces in the track", lambda: self.panel.use_guides_checkbox.toggle(),
+            checkable=True, tip="Fit a projection plane to each surface when tracking")
+        _action(m, "Show guide Roto node", self._open_roto)
+        m.aboutToShow.connect(
+            lambda: self.use_guides_action.setChecked(self.panel.use_guides_checkbox.isChecked()))
+
+        m = self.output_menu
+        _action(m, "Create All", lambda: self.panel.import_last_result(), "Ctrl+E",
+                tip="Camera, lens nodes and all geometry, in the comp")
+        self.create_one_submenu = m.addMenu("Create one")
+        self.create_one_submenu.aboutToShow.connect(
+            lambda: self._fill_create_menu(self.create_one_submenu))
+        _action(m, "Build geometry", lambda: self.panel.build_geometry())
+        m.addSeparator()
+        _action(m, "Open output folder", self._reveal_output)
+
+        m = self.view_menu
+        _action(m, "Fit", self.canvas.fit_view, "F")
+        m.addSeparator()
+        for key, text in ux.WORKSPACE_STEPS:
+            index = ux.step_index(key) + 1
+            _action(m, text, lambda k=key: self._set_step(k), str(index))
+        m.addSeparator()
+        _action(m, "Log", self._show_log)
+        _action(m, "Clear frame cache", lambda: self._clear_frame_cache(),
+                tip="Forget the frames held in memory and read them from disk again")
+
+    def _sync_track_menu(self):
+        running = self.panel.runner.is_running()
+        self.track_action.setEnabled(not running)
+        self.cancel_action.setEnabled(running)
+        self.background_action.setEnabled(running)
+        self.invert_action.setChecked(self.mask_invert_button.isChecked())
+
     def _install_shortcuts(self):
-        self.fit_shortcut = QtGui.QShortcut(
+        self.fit_shortcut = QShortcut(
             QtGui.QKeySequence("F"),
             self,
         )
@@ -1356,6 +1699,23 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.fit_shortcut.activated.connect(
             self._fit_shortcut_triggered
         )
+        self._install_playback_shortcuts()
+        for keys, slot in (
+            ("T", lambda: self._track()),
+            ("P", lambda: (self._set_step("draw"), self._add_surface())),
+            ("G", self._set_guide_frame),
+            ("Delete", self._delete_surface),
+            ("Ctrl+E", lambda: self.panel.import_last_result()),
+            ("1", lambda: self._set_step("track")),
+            ("2", lambda: self._set_step("draw")),
+            ("3", lambda: self._set_step("output")),
+        ):
+            shortcut = QShortcut(QtGui.QKeySequence(keys), self)
+            shortcut.setContext(WIDGET_WITH_CHILDREN_SHORTCUT)
+            shortcut.activated.connect(
+                lambda slot=slot: None if self._typing_in_field() else slot()
+            )
+            self.playback_shortcuts.append(shortcut)
 
     def _fit_shortcut_triggered(self):
         # Don't steal F while the artist is actively typing text/numbers in
@@ -1427,27 +1787,20 @@ class AutoLensDialog(QtWidgets.QDialog):
 
 
     def _timeline_frame_changed(self, frame):
-        try:
-            nuke.frame(
-                int(frame)
-            )
-        except Exception:
-            pass
-
-        self.frame_label.setText(
-            f"Frame {int(frame)}"
+        # While dragging, show whatever is cached right away; Nuke's frame,
+        # surfaces, mask overlay and any proxy render follow once the drag
+        # settles (mouse release or a short pause).
+        self._stop_playback(settle=False)
+        frame = int(frame)
+        previous = self._view_frame
+        direction = 0
+        if previous is not None and frame != previous:
+            direction = 1 if frame > previous else -1
+        self._show_frame(
+            frame,
+            settle=not self.timeline.scrubbing,
+            direction=direction,
         )
-        self.canvas.set_current_frame(
-            int(frame)
-        )
-        self._load_preview()
-        self._reload_surfaces()
-
-        if (
-            self.sidebar.currentIndex()
-            == self.masks_tab_index
-        ):
-            self._refresh_mask_preview()
 
 
     def _sidebar_tab_changed(self, index):
@@ -1461,8 +1814,9 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         if is_masks:
             self._reload_masks()
-            self._refresh_mask_preview()
+            self._refresh_mask_preview(force=True)
         else:
+            self._stop_mask_fill()
             self.canvas.clear_mask_overlay()
             self.canvas.update()
 
@@ -1534,7 +1888,10 @@ class AutoLensDialog(QtWidgets.QDialog):
             self.sidebar.currentIndex()
             == self.masks_tab_index
         ):
-            self._refresh_mask_preview()
+            self._refresh_mask_preview(clear=True)
+        else:
+            self._mask_overlays.clear()
+            self._mask_overlays.signature = None
 
         self.workspace_status.setText(
             "Mask interpretation inverted. "
@@ -1542,45 +1899,142 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
 
 
-    def _refresh_mask_preview(self):
+    def _refresh_mask_preview(self, frame=None, force=False, clear=False):
+        """
+        Show the mask overlay for `frame` (default: the shown frame) and keep
+        the idle filler going. `force` re-checks the mask's graph signature
+        (the cache is cleared only if the mask changed); `clear` always
+        starts over.
+        """
         if not mask_input_connected(
             self.controller_node
         ):
+            self._stop_mask_fill()
+            self._mask_overlays.clear()
+            self._mask_overlays.signature = None
             self.canvas.clear_mask_overlay()
+            self.timeline.set_mask_ranges(())
             return
 
-        self.workspace_status.setText(
-            "Rendering mask preview…"
-        )
-        QtWidgets.QApplication.processEvents()
+        if frame is None or isinstance(frame, bool):
+            # Menu actions pass Qt's `checked` flag; treat them as a full refresh.
+            force = force or isinstance(frame, bool)
+            frame = self._view_frame if self._view_frame is not None else int(nuke.frame())
+        frame = int(frame)
+        if clear:
+            self._mask_overlays.clear()
+            self._mask_overlays.signature = None
+            self._mask_job = None
+        if force or clear or self._mask_overlays.signature is None:
+            self._check_mask_signature()
 
+        self._show_mask_overlay(frame)
+        self._start_mask_fill()
+
+    def _check_mask_signature(self):
+        """Clear the overlay cache when the mask's upstream graph or keys changed."""
         try:
-            overlay = render_mask_overlay_pixmap(
-                self.controller_node,
-                int(nuke.frame()),
-            )
-            self.canvas.set_mask_overlay(
-                overlay,
-                visible=True,
-            )
-            self.workspace_status.setText(
-                "20% red = area AutoLens will avoid during tracking."
-            )
-        except Exception as exc:
-            self.canvas.clear_mask_overlay()
-            self.workspace_status.setText(
-                f"Mask preview failed: {exc}"
-            )
+            signature = mask_signature(self.controller_node)
+        except Exception:
+            signature = None
+        if self._mask_overlays.update_signature(signature):
+            self._mask_job = None
+            self.timeline.set_mask_ranges(())
+            return True
+        return False
 
+    def _show_mask_overlay(self, frame, direction=0):
+        # A frame that isn't sampled yet shows the nearest one that is, so the
+        # overlay never blinks while the cache fills.
+        overlay = self._mask_overlays.stand_in(frame, direction)
+        self.canvas.set_mask_overlay(
+            overlay if overlay is not None else QtGui.QPixmap(),
+            visible=True,
+        )
+
+    def _start_mask_fill(self):
+        if not self._mask_fill_timer.isActive():
+            self._mask_fill_logged = False
+            self._mask_fill_timer.start()
+
+    def _stop_mask_fill(self):
+        self._mask_fill_timer.stop()
+        self._mask_job = None
+
+    def _mask_fill_tick(self):
+        """Sample a few rows of the next missing overlay, nearest the playhead first."""
+        if not self.canvas.show_mask_overlay or not mask_input_connected(self.controller_node):
+            self._stop_mask_fill()
+            return
+        if self._playing():
+            # Sampling during playback would stutter; the stand-in covers gaps.
+            return
+        playhead = self._view_frame if self._view_frame is not None else int(nuke.frame())
+        cache = self._mask_overlays
+        wanted = fill_order(
+            playhead, self.timeline.first_frame, self.timeline.last_frame,
+            ready=cache.frames(), limit=1,
+        )
+        if not wanted:
+            self._mask_fill_timer.stop()
+            self._log_mask_fill(done=True)
+            return
+        want = wanted[0]
+        job = self._mask_job
+        if job is None or job.frame in cache or (job.frame != want and job.rows_done * 2 < job.height):
+            try:
+                job = mask_overlay_job(self.controller_node, want)
+            except Exception as exc:
+                self._stop_mask_fill()
+                self.workspace_status.setText(f"Mask preview failed: {exc}")
+                return
+            if job is None:
+                self._stop_mask_fill()
+                return
+            self._mask_job = job
+        if not job.frame_explicit and job.frame != int(nuke.frame()):
+            # This Nuke build can only sample its current frame: fill the
+            # shown frame once it settles, never move Nuke's frame from here.
+            self._stop_mask_fill()
+            return
+
+        if not job.step(0.010):
+            return
+        self._mask_job = None
+        if job.error is not None:
+            self._stop_mask_fill()
+            self.workspace_status.setText(f"Mask preview failed on frame {job.frame}: {job.error}")
+            return
+        cache.add(job.frame, overlay_pixmap(job), job.seconds)
+        if job.frame == self._view_frame or self._view_frame not in cache:
+            self._show_mask_overlay(self._view_frame if self._view_frame is not None else job.frame)
+        self.timeline.set_mask_ranges(cache.ranges())
+        if cache.filled == 10:
+            self._log_mask_fill()
+
+    def _log_mask_fill(self, done=False):
+        cache = self._mask_overlays
+        if not cache.filled or (done and self._mask_fill_logged):
+            return
+        self._mask_fill_logged = done
+        what = "all frames ready" if done else f"{cache.filled} frames so far"
+        try:
+            self.panel._append_log(
+                f"\n[AUTOLENS MASK] Overlay cache: {what}, "
+                f"{cache.ms_per_frame():.0f} ms per frame sampled.\n"
+            )
+        except Exception:
+            pass
 
     def _construct_panel(self):
-        # Make the upstream Read selected while the existing solve panel builds.
+        # Clear the selection while the solve panel builds so it can't pick up
+        # an unrelated selected Read. The upstream Read is applied once, by
+        # _load_node_settings(); selecting it here made the panel scan the
+        # plate folder and solve versions twice.
         old_selection = list(nuke.selectedNodes())
         try:
             for node in old_selection:
                 node.setSelected(False)
-            if self.read_node is not None:
-                self.read_node.setSelected(True)
 
             self.panel = AutoLensPanel(self)
         finally:
@@ -1592,20 +2046,317 @@ class AutoLensDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        self.panel.controller_node = self.controller_node
-        self.panel.background_requested.connect(
+        p = self.panel
+        p.controller_node = self.controller_node
+        p.background_requested.connect(
             self.enter_background_mode
         )
 
-        # Surface editing now lives in the permanent left viewport.
-        if hasattr(self.panel, "guide_group"):
-            self.panel.guide_group.hide()
+        # The panel keeps all the solve logic. Its run controls move into the
+        # Track and Output pages; the rest becomes the Solve settings window.
+        # Surface editing lives in the viewer, and the step pills replace the
+        # panel's own step indicator.
+        for widget in (p.guide_group, p.step_label, p.step_hint_label,
+                       p.completed_result_checkbox, p.background_button):
+            widget.hide()
 
+        p.run_button.setObjectName("Primary")
+        p.run_button.setStyleSheet("")
+        p.run_button.setIcon(icons.icon("track", "#071317"))
+        p.run_button.setIconSize(icons.icon_size())
+        p.run_button.setMinimumHeight(32)
+        self.track_row.addWidget(p.run_button, 1)
+        self.quality_button = QtWidgets.QPushButton()
+        self.quality_button.setObjectName("MenuButton")
+        self.quality_button.setAutoDefault(False)
+        self.quality_button.setMinimumHeight(32)
+        self.quality_button.setToolTip("Quality and what happens after the track")
+        self.quality_menu = QtWidgets.QMenu(self.quality_button)
+        self.quality_menu.aboutToShow.connect(self._fill_quality_menu)
+        self.quality_button.setMenu(self.quality_menu)
+        self.track_row.addWidget(self.quality_button)
+        p.quality_combo.currentTextChanged.connect(lambda _t: self._sync_quality_button())
+        self._sync_quality_button()
+
+        self.track_status_layout.addWidget(p.stage_label)
+        self.track_status_layout.addWidget(p.progress)
+        p.cancel_button.setText("  Stop")
+        p.cancel_button.setIcon(icons.icon("stop", "#ff8a9a"))
+        p.cancel_button.setIconSize(icons.icon_size())
+        self.track_status_layout.addWidget(p.cancel_button)
+
+        # What's left of the panel's "2. Solve" box is the quality settings.
+        quality_box = p.quality_combo.parentWidget()
+        if isinstance(quality_box, QtWidgets.QGroupBox):
+            quality_box.setTitle("Quality")
+        for widget in (p.run_button, p.cancel_button):
+            _repolish(widget)
+
+        p.import_button.setObjectName("Primary")
+        p.import_button.setText("  Create All")
+        p.import_button.setIcon(icons.icon("create", "#071317"))
+        p.import_button.setIconSize(icons.icon_size())
+        p.import_button.setMinimumHeight(32)
+        self.output_create_layout.addWidget(p.import_button)
+        _repolish(p.import_button)
+        p.reveal_button.hide()
+
+        # View > Log.
+        self.log_dialog = QtWidgets.QDialog(self)
+        self.log_dialog.setWindowTitle("AutoLens log")
+        self.log_dialog.resize(820, 460)
+        old_log_box = p.log.parentWidget()
+        _vbox(self.log_dialog, (10, 10, 10, 10), 0).addWidget(p.log)
+        if old_log_box is not None:
+            old_log_box.hide()
+
+        # File > Solve settings.
+        self.settings_dialog = QtWidgets.QDialog(self)
+        self.settings_dialog.setWindowTitle("AutoLens solve settings")
+        self.settings_dialog.resize(560, 760)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setWidget(self.panel)
-        self.solve_layout.addWidget(scroll)
+        scroll.setWidget(p)
+        _vbox(self.settings_dialog, (0, 0, 0, 0), 0).addWidget(scroll)
+        self.settings_toggle.clicked.connect(self._show_settings)
+
+        p.runner.started.connect(self._refresh_workflow)
+        p.import_button.clicked.connect(
+            lambda: QtCore.QTimer.singleShot(0, self._refresh_workflow))
+
+    # ------------------------------------------------------------------
+    # Workflow: Track -> Draw -> Output
+    # ------------------------------------------------------------------
+    def _set_step(self, key):
+        self._step = ux.WORKSPACE_KEYS[ux.step_index(key)]
+        index = ux.step_index(self._step)
+        if self.sidebar.currentIndex() != index:
+            self.sidebar.setCurrentIndex(index)
+        self._refresh_workflow()
+
+    def _track(self):
+        self._set_step("track")
+        self.panel.run_autolens()
+
+    def _show_settings(self):
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def _show_log(self):
+        self.log_dialog.show()
+        self.log_dialog.raise_()
+
+    def _reveal_output(self):
+        try:
+            from .panel import _open_folder
+            _open_folder(self.panel._resolved_output_folder())
+        except Exception as exc:
+            self.workspace_status.setText(f"Couldn't open the output folder: {exc}")
+
+    def _sync_quality_button(self):
+        self.quality_button.setText(self.panel.quality_combo.currentText())
+
+    def _fill_quality_menu(self):
+        p = self.panel
+        menu = self.quality_menu
+        menu.clear()
+        group = _action_group(self)
+        for name in ux.QUALITY_ORDER:
+            a = _action(menu, name, lambda n=name: p.quality_combo.setCurrentText(n),
+                        checkable=True, tip=ux.preset_summary(name))
+            a.setChecked(p.quality_combo.currentText() == name)
+            group.addAction(a)
+        menu.addSeparator()
+        a = _action(menu, "Build geometry during the track",
+                    lambda: p.build_geometry_checkbox.toggle(), checkable=True,
+                    tip=p.build_geometry_checkbox.toolTip())
+        a.setChecked(p.build_geometry_checkbox.isChecked())
+        a = _action(menu, "Create All when the track finishes",
+                    lambda: p.import_when_done.toggle(), checkable=True,
+                    tip=p.import_when_done.toolTip())
+        a.setChecked(p.import_when_done.isChecked())
+        menu.addSeparator()
+        _action(menu, "More settings…", self._show_settings)
+
+    def _fill_create_menu(self, menu):
+        from .node import solve_item_options
+
+        menu.clear()
+        solved = bool(self.panel.last_result_nk)
+        try:
+            items = solve_item_options(self.controller_node) if solved else []
+        except Exception:
+            items = []
+        if not items:
+            a = menu.addAction("Track first")
+            a.setEnabled(False)
+            return
+        for item in items:
+            _action(menu, item, lambda i=item: self._create_one(i))
+
+    def _create_one(self, item):
+        from .node import create_selected_solve_item
+
+        try:
+            created = create_selected_solve_item(self.controller_node, item)
+        except Exception:
+            # create_selected_solve_item already told the artist why.
+            return
+        if created is not None:
+            self.workspace_status.setText(f"Created {created.name()}.")
+
+    def _timing_toggled(self, shown):
+        self.timing_toggle.setText("Timing \u25be" if shown else "Timing \u25b8")
+        self.timing_label.setVisible(bool(shown) and bool(self.timing_label.text()))
+
+    def _update_timing(self, timing, geometry_timing=None):
+        """Chip tooltip and the Output step's Timing breakdown."""
+        lines = ux.timing_lines(timing)
+        base_tip = (
+            "Track status. After a track it shows the mean reprojection error "
+            "(under about 1 px is a good solve) and how long the track took."
+        )
+        if not lines:
+            self.chip.setToolTip(base_tip)
+            self.timing_label.setText("")
+            self.timing_toggle.setEnabled(False)
+            self.timing_label.hide()
+            return
+        rows = "".join(
+            f"<tr><td>{name}</td><td align='right'>&nbsp;&nbsp;{text}</td></tr>"
+            for name, text in lines
+        )
+        extra = ""
+        if geometry_timing and geometry_timing.get("total_seconds") is not None:
+            extra = (
+                "<br>Last geometry build: "
+                + ux.format_duration(float(geometry_timing["total_seconds"]))
+            )
+        html = f"<table>{rows}</table>{extra}"
+        self.timing_label.setText(html)
+        self.timing_toggle.setEnabled(True)
+        self.timing_label.setVisible(self.timing_toggle.isChecked())
+        self.chip.setToolTip(base_tip + "<br><br>" + html)
+
+    def _solve_result(self):
+        """autolens_result.json of the selected version, re-read only when it changes."""
+        folder = self.panel._resolved_output_folder()
+        path = os.path.join(folder, "autolens_result.json") if folder else ""
+        try:
+            stamp = os.path.getmtime(path) if path else None
+        except OSError:
+            stamp = None
+        cached_path, cached_stamp, cached = self._result_cache
+        if cached_path == path and cached_stamp == stamp:
+            return cached
+        result = ux.load_result(folder) if stamp is not None else {}
+        self._result_cache = (path, stamp, result)
+        return result
+
+    def _refresh_workflow(self, *_args):
+        """Step pills, viewer chip, next-step hint and the Output page."""
+        if not hasattr(self, "panel"):
+            return
+        p = self.panel
+        running = p.runner.is_running()
+        solved = bool(p.last_result_nk)
+        failed = bool(p.last_failure) and not solved
+        result = self._solve_result() if solved else {}
+        folder = p._resolved_output_folder()
+        building = running and bool(getattr(p, "geometry_build_running", False))
+        geometry, items, geometry_detail = ux.geometry_overview(
+            result, ux.load_geometry_status(folder) if solved else {}, running=running,
+        )
+        surfaces = len(getattr(self.canvas, "surfaces", []) or [])
+        has_plate = self.read_node is not None
+        installed = bool(getattr(p, "_install_ready", True))
+
+        states = ux.workspace_step_states(
+            self._step, solved=solved, failed=failed,
+            surfaces=surfaces, created=bool(getattr(p, "_imported", False)),
+        )
+        for key, button in self.step_buttons.items():
+            if button.property("state") != states[key]:
+                button.setProperty("state", states[key])
+                button.style().unpolish(button)
+                button.style().polish(button)
+
+        ui_timing = ux.load_ui_timing(folder) if solved else {}
+        timing = ux.track_time(result, ui_timing.get("track")) if solved else {}
+        text, chip_state = ux.solve_chip(
+            running=running, percent=self._last_percent, solved=solved and not running,
+            failed=failed, error_px=ux.result_error_px(result), building=building,
+            duration=ux.track_time_text(timing),
+        )
+        self.chip.setText(text)
+        self.chip.setStyleSheet(theme.chip_style(chip_state))
+        self._update_timing(timing, ui_timing.get("geometry"))
+
+        hint_args = dict(
+            has_plate=has_plate, installed=installed, running=running, solved=solved,
+            surfaces=surfaces, geometry_ready=geometry == "ready",
+            created=bool(getattr(p, "_imported", False)),
+            geometry=geometry, geometry_detail=geometry_detail,
+        )
+        self.hint_label.setText(ux.workspace_hint(self._step, **hint_args))
+        self.track_info.setText(ux.workspace_hint("track", **hint_args))
+        self.draw_info.setText(ux.workspace_hint("draw", **hint_args))
+        self.output_info.setText(ux.workspace_hint("output", **hint_args))
+
+        for state_label, (_name, ready) in zip(self.geometry_rows, items):
+            if not solved:
+                state_label.setText("—")
+                state_label.setStyleSheet("")
+            elif ready:
+                state_label.setText("✓ ready")
+                state_label.setStyleSheet(f"color: {theme.CACHE};")
+            elif geometry == "building":
+                state_label.setText("building…")
+                state_label.setStyleSheet(f"color: {theme.ACCENT};")
+            else:
+                state_label.setText("not built")
+                state_label.setStyleSheet(f"color: {theme.TEXT_FAINT};")
+        if geometry == "building":
+            self.geometry_detail.setText(geometry_detail or "Building…")
+            self.geometry_detail.setStyleSheet(f"color: {theme.ACCENT};")
+        elif geometry == "failed":
+            self.geometry_detail.setText(
+                "Last build failed" + (f": {geometry_detail}" if geometry_detail else "."))
+            self.geometry_detail.setStyleSheet(f"color: {theme.STATUS_FAILED};")
+        elif geometry == "missing":
+            self.geometry_detail.setText("Camera-only track: geometry not built yet.")
+            self.geometry_detail.setStyleSheet("")
+        else:
+            self.geometry_detail.setText("")
+        self.geometry_detail.setVisible(bool(self.geometry_detail.text()))
+        self.build_geometry_button.setEnabled(solved and not running)
+        self.build_geometry_button.setText(
+            "  Rebuild geometry" if geometry == "ready" else "  Build geometry")
+        self.create_one_button.setEnabled(solved)
+        self.track_transport_button.setEnabled(not running)
+        self.stop_transport_button.setEnabled(running)
+        p.cancel_button.setVisible(running)
+        p.progress.setVisible(running or p.progress.value() > 0)
+
+        read = self.read_node
+        width = height = 0
+        first = last = None
+        info = getattr(self, "_preview_info", {}) or {}
+        width, height = info.get("width", 0), info.get("height", 0)
+        if read is not None:
+            try:
+                frame_range = source_frame_range(read)
+                if frame_range:
+                    first, last = frame_range
+            except Exception:
+                pass
+        self.shot_label.setText(ux.shot_summary(
+            read.name() if read is not None else "",
+            width if width > 1 else 0, height if height > 1 else 0,
+            first, last, p._selected_version() if p.output_edit.text().strip() else "",
+        ))
 
     # ------------------------------------------------------------------
     # Existing node setting sync
@@ -1655,6 +2406,22 @@ class AutoLensDialog(QtWidgets.QDialog):
                 ].value()
         except Exception:
             pass
+
+        # Each setText() on these fields fires a version rescan, a result
+        # rescan and a plate-folder count through the panel's signals, on top
+        # of the explicit calls below. Hold the signals while the fields are
+        # filled; the explicit sync and restore_result_state() below bring the
+        # panel and controller to the same final state.
+        blocked = [
+            widget
+            for widget in (
+                getattr(self.panel, "source_edit", None),
+                getattr(self.panel, "output_edit", None),
+                getattr(self.panel, "version_combo", None),
+            )
+            if widget is not None
+        ]
+        was_blocked = [widget.blockSignals(True) for widget in blocked]
 
         if read is not None:
             self.panel.use_selected_read(read)
@@ -1726,11 +2493,14 @@ class AutoLensDialog(QtWidgets.QDialog):
                         index
                     )
 
+        for widget, previous in zip(blocked, was_blocked):
+            widget.blockSignals(previous)
+
         # One final sync ensures the Setup / Run panel and controller agree on
         # the user's selected version before any result/cache state is restored.
+        # restore_result_state() runs once, at the end, after the remaining
+        # settings are loaded; it rescans the output folder each time.
         self.panel._sync_controller_output()
-        self.panel.restore_result_state()
-        self.panel._update_run_button_text()
 
         if node.knob("autolens_quality"):
             idx = self.panel.quality_combo.findText(
@@ -1804,12 +2574,14 @@ class AutoLensDialog(QtWidgets.QDialog):
     # Preview
     # ------------------------------------------------------------------
     def _load_preview(self):
+        """Point the viewer at the source Read and show Nuke's current frame."""
         self.frame_label.setText(f"Frame {int(nuke.frame())}")
 
         read = self.read_node or source_read_for_node(self.controller_node)
         if read is None:
             self.workspace_status.setText("No upstream Read node.")
             self.canvas.set_image(QtGui.QPixmap(), 1, 1)
+            self._preview_mode = None
             return
 
         self.read_node = read
@@ -1820,9 +2592,6 @@ class AutoLensDialog(QtWidgets.QDialog):
             read,
         )
         frame = int(frame_info["frame"])
-        if hasattr(self, "timeline"):
-            self.timeline.set_current_frame(frame)
-
 
         if frame_info["clamped"]:
             try:
@@ -1830,88 +2599,753 @@ class AutoLensDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        self.workspace_status.setText("Loading preview…")
-        QtWidgets.QApplication.processEvents()
-
-        pixmap = QtGui.QPixmap()
-
-        # Fast path: let Qt load common image formats directly.
-        old_frame = int(nuke.frame())
-        filename = ""
-        try:
-            nuke.frame(frame)
-            try:
-                filename = nuke.filename(read) or read["file"].evaluate()
-            except Exception:
-                filename = read["file"].evaluate()
-        finally:
-            nuke.frame(old_frame)
-
-        if filename and Path(filename).exists():
-            pixmap = QtGui.QPixmap(filename)
-
-        # Robust path: ask Nuke to render one temporary PNG. This also handles
-        # EXR/TIFF formats Qt cannot decode itself.
-        if pixmap.isNull():
-            temp_path = Path(tempfile.gettempdir()) / (
-                f"autolens_preview_{uuid.uuid4().hex}.png"
+        # The timeline range bounds stepping and playback.
+        frame_range = source_frame_range(read)
+        if frame_range:
+            self.timeline.set_range(frame_range[0], frame_range[1])
+        else:
+            self.timeline.set_range(
+                min(frame, self.timeline.first_frame),
+                max(frame, self.timeline.last_frame),
             )
-            write = None
-            try:
-                input_node = self.controller_node.input(0) or read
-                write = nuke.nodes.Write()
-                write.setInput(0, input_node)
-                write["file"].setValue(str(temp_path).replace("\\", "/"))
-                if write.knob("file_type"):
-                    write["file_type"].setValue("png")
-                if write.knob("channels"):
-                    write["channels"].setValue("rgb")
 
-                nuke.execute(write.name(), frame, frame)
-                pixmap = QtGui.QPixmap(str(temp_path))
-            except Exception as exc:
-                self.workspace_status.setText(
-                    f"Preview render failed: {exc}"
-                )
-            finally:
-                if write is not None:
-                    try:
-                        nuke.delete(write)
-                    except Exception:
-                        pass
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
+        self._setup_preview_source(read, force=True)
+        decode_failed = False
+        if self._preview_mode == "qt" and self._preview_path_for_frame(frame):
+            # One quick Qt decode so a JPEG/PNG plate is there at once; EXR
+            # frames arrive from the frame server a moment later.
+            decode_failed = self._preview.load_now(frame) is None
+        self._show_frame(frame, settle=False)
+        self._settle_frame(frame, refresh_surfaces=False)
+        if decode_failed:
+            self._preview_frame_failed(frame)
 
-        try:
-            pixel_aspect = float(read.format().pixelAspect())
-        except Exception:
-            pixel_aspect = 1.0
+        if frame_info["clamped"] and self._view_exact:
+            self.workspace_status.setText(
+                self.workspace_status.text()
+                + f" • auto-clamped from {requested_frame} "
+                f"to source range {frame_info['first']}–{frame_info['last']}"
+            )
 
-        self.canvas.set_image(
-            pixmap,
-            int(read.width()),
-            int(read.height()),
-            pixel_aspect=pixel_aspect,
+    # ------------------------------------------------------------------
+    # Preview source, frame cache and playback
+    # ------------------------------------------------------------------
+    def _build_playback_bar(self, layout):
+        """Transport controls under the timeline, plus the frame cache."""
+        self._view_frame = None
+        # frame -> overlay pixmap for the connected mask, filled in idle time.
+        self._mask_overlays = OverlayCache()
+        self._mask_job = None
+        self._mask_fill_logged = False
+        self._mask_fill_timer = QtCore.QTimer(self)
+        self._mask_fill_timer.setInterval(15)
+        self._mask_fill_timer.timeout.connect(self._mask_fill_tick)
+        self._view_exact = False
+        self._displayed_frame = None
+        self._preview_mode = None          # "qt", "server" or None
+        self._preview_info = {}
+        self._preview_signature = None
+        self._preview_decoder = None
+        self._preview_note = ""            # e.g. upstream nodes not shown
+        self._preview_problem = ""         # why no frames can be shown
+        self._read_snapshot = None         # plate_reader.ReadSnapshot
+        self._frame_server = None          # frame_server.FrameServerPool
+        self._play_clock = None
+        self._play_shown = 0
+        self._play_held = 0
+        self._play_stats_time = 0.0
+        self._qt_formats = supported_extensions()
+
+        self._preview = PreviewLoader(
+            self,
+            cache_budget_bytes(),
+            workers=min(4, max(2, (os.cpu_count() or 4) // 2)),
+        )
+        self._preview.on_frames_ready = self._preview_frames_ready
+        self._preview.on_frame_failed = self._preview_frame_failed
+        self._preview.on_full_ready = self._preview_full_ready
+
+        self._play_timer = QtCore.QTimer(self)
+        self._play_timer.setTimerType(PRECISE_TIMER)
+        self._play_timer.timeout.connect(self._playback_tick)
+
+        self._settle_timer = QtCore.QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(150)
+        self._settle_timer.timeout.connect(
+            lambda: self._settle_frame(self._view_frame)
         )
 
-        if pixmap.isNull():
-            self.workspace_status.setText(
-                "Preview unavailable; surface data is still editable."
-            )
-        else:
-            suffix = ""
-            if frame_info["clamped"]:
-                suffix = (
-                    f" • auto-clamped from {requested_frame} "
-                    f"to source range {frame_info['first']}–{frame_info['last']}"
-                )
+        self._sharp_timer = QtCore.QTimer(self)
+        self._sharp_timer.setSingleShot(True)
+        self._sharp_timer.setInterval(250)
+        self._sharp_timer.timeout.connect(self._request_sharp)
 
-            self.workspace_status.setText(
-                f"Frame {frame} • {read.width()} × {read.height()} "
-                f"• PAR {pixel_aspect:g}{suffix}"
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(10, 6, 10, 6)
+        bar.setSpacing(4)
+
+        def button(icon_name, tip, slot, name="Transport"):
+            b = _icon_button(icon_name, tip, name=name)
+            # Keep keyboard focus off the transport so Space always plays.
+            b.setFocusPolicy(NO_FOCUS)
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+            return b
+
+        button("first", "First frame (Home)", lambda: self._go_to_end(-1))
+        button("prev", "Previous frame (← or ,)", lambda: self._step(-1))
+        self.frame_field = QtWidgets.QSpinBox()
+        self.frame_field.setObjectName("FrameField")
+        self.frame_field.setProperty("bare", True)
+        self.frame_field.setButtonSymbols(_NO_BUTTONS)
+        self.frame_field.setRange(-10000000, 10000000)
+        self.frame_field.setFixedWidth(72)
+        self.frame_field.setKeyboardTracking(False)
+        self.frame_field.setToolTip("Current frame: type a frame and press Enter")
+        self.frame_field.valueChanged.connect(self._frame_field_changed)
+        bar.addWidget(self.frame_field)
+        button("next", "Next frame (→ or .)", lambda: self._step(1))
+        button("last", "Last frame (End)", lambda: self._go_to_end(1))
+        bar.addSpacing(4)
+        self.play_back_button = button(
+            "play_back", "Play backwards", lambda: self._toggle_playback(-1)
+        )
+        self.play_button = button(
+            "play", "Play / pause (Space)", lambda: self._toggle_playback(1)
+        )
+        bar.addSpacing(6)
+        self.loop_button = QtWidgets.QPushButton("Loop")
+        self.loop_button.setObjectName("Toggle")
+        self.loop_button.setCheckable(True)
+        self.loop_button.setChecked(True)
+        self.loop_button.setFocusPolicy(NO_FOCUS)
+        self.loop_button.setToolTip("Loop playback over the source range")
+        bar.addWidget(self.loop_button)
+
+        self.fps_spin = QtWidgets.QDoubleSpinBox()
+        self.fps_spin.setRange(1.0, 120.0)
+        self.fps_spin.setDecimals(2)
+        self.fps_spin.setSuffix(" fps")
+        self.fps_spin.setProperty("bare", True)
+        self.fps_spin.setButtonSymbols(_NO_BUTTONS)
+        self.fps_spin.setFixedWidth(78)
+        self.fps_spin.setToolTip(
+            "Playback speed. Frames that aren't decoded in time are skipped "
+            "so playback stays in real time."
+        )
+        try:
+            fps = float(nuke.root()["fps"].value())
+        except Exception:
+            fps = 24.0
+        self.fps_spin.setValue(fps if fps > 0 else 24.0)
+        bar.addWidget(self.fps_spin)
+
+        # Centre: the one action of the Track step, as in Match.
+        bar.addStretch(1)
+        bar.addWidget(_label("Track", "Dim"))
+        bar.addSpacing(4)
+        self.track_transport_button = button(
+            "track", "Track the camera and lens (T)", lambda: self._track(), name="TrackButton"
+        )
+        self.stop_transport_button = button(
+            "stop", "Stop tracking", lambda: self.panel.runner.cancel(), name="Stop"
+        )
+        self.stop_transport_button.setEnabled(False)
+        bar.addStretch(1)
+
+        self.cache_label = _label("", "Faint")
+        self.cache_label.setToolTip(
+            "Frames decoded in memory (green in the timeline). View > Clear frame cache forgets them."
+        )
+        bar.addWidget(self.cache_label)
+
+        layout.addLayout(bar)
+
+        self.timeline.scrubStarted.connect(
+            lambda: self._stop_playback(settle=False)
+        )
+        self.timeline.scrubFinished.connect(self._settle_frame)
+        self.canvas.zoomChanged.connect(
+            lambda _zoom: self._sharp_timer.start()
+        )
+        # A bigger viewer (e.g. the window maximising after it opens) gets
+        # sharper frames once the resize settles, not mid-playback.
+        self._resize_timer = QtCore.QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(300)
+        self._resize_timer.timeout.connect(self._refresh_decode_width)
+        self.canvas.resized.connect(self._resize_timer.start)
+        self.finished.connect(self._shutdown_preview)
+
+    def _install_playback_shortcuts(self):
+        self.playback_shortcuts = []
+        for keys, slot in (
+            ("Space", lambda: self._toggle_playback(0)),
+            (",", lambda: self._step(-1)),
+            (".", lambda: self._step(1)),
+        ):
+            shortcut = QShortcut(QtGui.QKeySequence(keys), self)
+            shortcut.setContext(WIDGET_WITH_CHILDREN_SHORTCUT)
+            shortcut.activated.connect(
+                lambda slot=slot: None if self._typing_in_field() else slot()
             )
+            self.playback_shortcuts.append(shortcut)
+
+    def _typing_in_field(self):
+        focus = QtWidgets.QApplication.focusWidget()
+        return isinstance(
+            focus,
+            (
+                QtWidgets.QLineEdit,
+                QtWidgets.QTextEdit,
+                QtWidgets.QPlainTextEdit,
+                QtWidgets.QAbstractSpinBox,
+                QtWidgets.QComboBox,
+            ),
+        )
+
+    def keyPressEvent(self, event):
+        # Arrow keys reach here when the viewer/timeline (or anything that
+        # doesn't use them itself) has focus. Shift steps 10 frames.
+        key = event.key()
+        try:
+            shift = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+        except Exception:
+            shift = False
+        if key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
+            delta = 10 if shift else 1
+            self._step(delta if key == QtCore.Qt.Key_Right else -delta)
+            event.accept()
+            return
+        if key in (QtCore.Qt.Key_Home, QtCore.Qt.Key_End):
+            self._go_to_end(1 if key == QtCore.Qt.Key_End else -1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # Source -----------------------------------------------------------
+    def _refresh_decode_width(self):
+        if not self._preview_mode or self._playing():
+            return
+        if self._viewer_decode_width() > self._preview._max_w:
+            self._preview.set_source(
+                self._preview.source,
+                self._preview_path_for_frame,
+                self._viewer_decode_width(),
+                self._preview_info.get("pa", 1.0),
+                decoder=self._preview_decoder,
+            )
+            if self._view_frame is not None:
+                self._request_around(self._view_frame, 0)
+
+    def _viewer_decode_width(self):
+        try:
+            ratio = float(self.canvas.devicePixelRatioF())
+        except Exception:
+            ratio = 1.0
+        return bucket_width(max(320, self.canvas.width()) * ratio)
+
+    def _snapshot_read(self, read):
+        """Copy the Read knobs the viewer needs (main thread, once per settle)."""
+        def value(name, default=""):
+            k = read.knob(name)
+            if k is None:
+                return default
+            try:
+                return k.value()
+            except Exception:
+                return default
+
+        candidates = [value("file")]
+        try:
+            candidates.append(nuke.filename(read))
+        except Exception:
+            pass
+        try:
+            project = nuke.root()["project_directory"].value()
+        except Exception:
+            project = ""
+        frame_range = source_frame_range(read)
+        if not frame_range:
+            frame = self._view_frame if self._view_frame is not None else int(nuke.frame())
+            frame_range = (frame, frame)
+        try:
+            pa = float(read.format().pixelAspect())
+        except Exception:
+            pa = 1.0
+        return ReadSnapshot(
+            choose_pattern(candidates, project) or "",
+            frame_range[0],
+            frame_range[1],
+            frame_offset=value("frame"),
+            frame_mode=value("frame_mode"),
+            before=value("before", "hold"),
+            after=value("after", "hold"),
+            colorspace=value("colorspace", "default"),
+            raw=value("raw", False),
+            width=read.width(),
+            height=read.height(),
+            pixel_aspect=pa,
+        )
+
+    def _upstream_chain(self, read):
+        """[(class, disabled)] for the nodes between AutoLens and its Read."""
+        def name(node):
+            try:
+                return node.fullName()
+            except Exception:
+                return id(node)
+
+        chain = []
+        node = self.controller_node.input(0) if self.controller_node.inputs() else None
+        target = name(read)
+        while node is not None and name(node) != target and len(chain) < 500:
+            try:
+                cls = node.Class()
+            except Exception:
+                cls = "?"
+            disabled = False
+            try:
+                k = node.knob("disable")
+                disabled = bool(k.value()) if k is not None else False
+            except Exception:
+                pass
+            chain.append((cls, disabled))
+            node = node.input(0) if node.inputs() else None
+        return chain
+
+    def _ensure_frame_server(self, python):
+        pool = self._frame_server
+        if pool is not None and pool.python == python:
+            return pool
+        if pool is not None:
+            pool.close()
+        self._frame_server = FrameServerPool(python, size=self._preview.workers)
+        return self._frame_server
+
+    def _setup_preview_source(self, read, force=False):
+        """Point the viewer at the Read's own files. Renders nothing.
+
+        Like Mocha, frames are read straight from the files on disk: JPEG,
+        PNG and TIFF by Qt on background threads, EXR and DPX by frame-server
+        processes in AutoLens's managed Python, which send back viewer-sized
+        8-bit sRGB. Nothing is re-encoded or written.
+        """
+        snap = self._snapshot_read(read)
+        note = upstream_note(self._upstream_chain(read))
+        note = f" • {note}" if note else ""
+        signature = snap.key()
+        max_w = self._viewer_decode_width()
+        if not force and signature == self._preview_signature and self._preview_mode:
+            self._preview_note = note + self._preview_info.get("colour_note", "")
+            self._preview.set_source(
+                self._preview.source,
+                self._preview_path_for_frame,
+                max_w,
+                snap.pixel_aspect,
+                decoder=self._preview_decoder,
+            )
+            return
+
+        self._read_snapshot = snap
+        self._preview_signature = signature
+        info = {
+            "width": snap.width,
+            "height": snap.height,
+            "pa": snap.pixel_aspect,
+            "colour_note": "",
+            "source": "",
+        }
+        ext = snap.extension
+        mode, decoder, problem = None, None, ""
+        if not snap.pattern:
+            problem = (
+                "The viewer can't resolve this Read's file path (an expression, "
+                "or a relative path without a project directory)."
+            )
+        elif ext in self._qt_formats:
+            mode, decoder = "qt", decode_image
+            info["source"] = "read directly"
+        elif ext in WORKER_EXTS:
+            configured = ""
+            try:
+                configured = self.controller_node["autolens_python"].value()
+            except Exception:
+                pass
+            python = managed_python(configured)
+            if python is None:
+                problem = (
+                    f"AutoLens's Python runtime isn't installed, so .{ext} plates "
+                    "can't be shown in the viewer (JPEG/PNG/TIFF can). "
+                    "Set it up from the Solve tab."
+                )
+            else:
+                transfer, exact = transfer_for(snap.colorspace, snap.raw, ext)
+                mode = "server"
+                decoder = worker_decoder(self._ensure_frame_server(python), transfer)
+                info["source"] = f"read directly, {transfer} → sRGB"
+                if not exact:
+                    info["colour_note"] = (
+                        f" • colour approximated for '{snap.colorspace}'"
+                    )
+        else:
+            problem = f"The viewer can't read .{ext} files directly."
+
+        self._preview_mode = mode
+        self._preview_decoder = decoder
+        self._preview_problem = problem
+        self._preview_note = note + info["colour_note"]
+        self._preview_info = info
+        self._preview.set_source(
+            ("plate", signature, mode),
+            self._preview_path_for_frame,
+            max_w,
+            snap.pixel_aspect,
+            decoder=decoder,
+        )
+        if problem:
+            self.workspace_status.setText(problem)
+        self._update_cache_bar()
+
+    def _preview_path_for_frame(self, frame):
+        snap = self._read_snapshot
+        if snap is None or not self._preview_mode:
+            return None
+        return snap.path(frame)
+
+    # Frames -----------------------------------------------------------
+    def _show_frame(self, frame, settle=False, direction=0, playing=False):
+        """Put `frame` on screen as fast as possible.
+
+        In memory: shown now. Otherwise the nearest frame in memory stands in
+        (held while playing) and the exact frame is swapped in as soon as it
+        has been read from disk. Never renders anything.
+        """
+        frame = clamp_frame(
+            frame,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+        )
+        self._view_frame = frame
+        self.timeline.set_current_frame(frame)
+        if self.frame_field.value() != frame:
+            self.frame_field.blockSignals(True)
+            self.frame_field.setValue(frame)
+            self.frame_field.blockSignals(False)
+        self.canvas.set_current_frame(frame)
+        self._preview.protect = {frame}
+        if self.canvas.show_mask_overlay:
+            self._show_mask_overlay(frame, direction)
+
+        pixmap = self._preview.pixmap(frame)
+        if pixmap is not None:
+            self._display_pixmap(pixmap, frame)
+        else:
+            self._view_exact = False
+            stand_in = None
+            if playing:
+                stand_in = self._displayed_frame
+            elif self._preview_mode:
+                stand_in = nearest_cached(
+                    frame, self._preview.frames(), direction
+                )
+                if stand_in is not None:
+                    self._display_pixmap(self._preview.pixmap(stand_in), stand_in)
+            label = f"Frame {frame}"
+            if stand_in is not None and stand_in != frame:
+                label += f"  (showing {stand_in})"
+            self.frame_label.setText(label)
+
+        self._request_around(frame, direction)
+
+        if playing:
+            return
+        if settle:
+            self._settle_frame(frame)
+        else:
+            self._settle_timer.start()
+
+    def _display_pixmap(self, pixmap, frame):
+        info = self._preview_info
+        self.canvas.set_image(
+            pixmap,
+            info.get("width", 1),
+            info.get("height", 1),
+            pixel_aspect=info.get("pa", 1.0),
+        )
+        self._displayed_frame = frame
+        self._view_exact = frame == self._view_frame
+        if self._view_exact:
+            self.frame_label.setText(f"Frame {frame}")
+            if self._playing():
+                self._play_shown += 1
+
+    def _request_around(self, frame, direction):
+        if not self._preview_mode:
+            return
+        capacity = self._preview.capacity_frames(
+            self._preview_info.get("width", 1),
+            self._preview_info.get("height", 1),
+        )
+        if self._playing():
+            ahead = max(2, min(96, int(capacity * 0.6)))
+            behind = max(1, min(16, int(capacity * 0.15)))
+        else:
+            ahead = max(1, min(48, int(capacity * 0.4)))
+            behind = max(1, min(16, int(capacity * 0.15)))
+        loop = self._playing() and self.loop_button.isChecked()
+        order = [frame] + prefetch_order(
+            frame,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+            direction,
+            ahead,
+            behind,
+            loop=loop,
+        )
+        self._preview.request(order)
+
+    def _settle_frame(self, frame, refresh_surfaces=True):
+        """Bring Nuke and the rest of the workspace onto the shown frame."""
+        self._settle_timer.stop()
+        if frame is None or self._playing():
+            return
+        frame = int(frame)
+        if frame != self._view_frame:
+            self._show_frame(frame, settle=False)
+            self._settle_timer.stop()
+
+        try:
+            if int(nuke.frame()) != frame:
+                nuke.frame(frame)
+        except Exception:
+            pass
+
+        # Pick up a newly connected Read or edited Read knobs.
+        read = source_read_for_node(self.controller_node) or self.read_node
+        if read is not None:
+            changed = self.read_node is None or self.read_node.fullName() != read.fullName()
+            self.read_node = read
+            self._setup_preview_source(read, force=changed)
+
+        if refresh_surfaces:
+            self._reload_surfaces()
+            if self.sidebar.currentIndex() == self.masks_tab_index:
+                self._refresh_mask_preview(frame)
+
+        pixmap = self._preview.pixmap(frame)
+        if pixmap is not None:
+            self._display_pixmap(pixmap, frame)
+            self._sharp_timer.start()
+        self._request_around(frame, 0)
+        self._update_cache_bar()
+        self._update_frame_status()
+
+    def _update_frame_status(self):
+        if self._preview_problem:
+            self.workspace_status.setText(self._preview_problem)
+            return
+        if not self._preview_mode:
+            return
+        info = self._preview_info
+        frame = self._view_frame
+        if not self._view_exact:
+            path = self._preview_path_for_frame(frame)
+            error = self._preview.errors.get(frame)
+            if path is None:
+                text = f"Frame {frame} is outside the Read's frames (black)."
+            elif error:
+                text = f"Frame {frame} couldn't be read: {error}"
+            elif frame in self._preview.failed:
+                text = f"Frame {frame} couldn't be read: {path}"
+            else:
+                text = f"Reading frame {frame}…"
+            self.workspace_status.setText(text + self._preview_note)
+            return
+        self.workspace_status.setText(
+            f"Frame {frame} • {info['width']} × {info['height']} "
+            f"• PAR {info['pa']:g} • {info['source']}{self._preview_note}"
+        )
+
+    def _request_sharp(self):
+        # Viewer-sized frames look soft when zoomed in; load the settled frame
+        # at full size.
+        if (
+            self._preview_mode
+            and not self._playing()
+            and self.canvas.zoom > 1.25
+            and self._view_frame is not None
+        ):
+            full = self._preview.full
+            if full is not None and full[0] == self._view_frame:
+                self._preview_full_ready(self._view_frame)
+            else:
+                self._preview.request_full(self._view_frame)
+
+    def _preview_full_ready(self, frame):
+        full = self._preview.full
+        if (
+            full is not None
+            and frame == self._view_frame
+            and not self._playing()
+            and self._view_exact
+        ):
+            self._display_pixmap(full[1], frame)
+
+    def _preview_frames_ready(self, frames):
+        if self._view_frame in frames and not self._view_exact:
+            self._display_pixmap(self._preview.pixmap(self._view_frame), self._view_frame)
+            if not self._playing() and not self._settle_timer.isActive():
+                self._update_frame_status()
+        self._update_cache_bar()
+
+    def _preview_frame_failed(self, frame):
+        if frame == self._view_frame and not self._playing():
+            self._update_frame_status()
+
+    def _update_cache_bar(self):
+        frames = self._preview.frames()
+        self.timeline.set_cached_ranges(contiguous_runs(frames), ())
+        used = self._preview.cache.total_bytes / (1024.0 * 1024.0)
+        self.cache_label.setText(f"{len(frames)} in memory • {used:.0f} MB")
+
+    # Transport --------------------------------------------------------
+    def _playing(self):
+        return self._play_timer.isActive()
+
+    def _toggle_playback(self, direction=0):
+        """direction 0 (Space): pause, or play forwards. A play button
+        pauses its own direction and reverses the other."""
+        if self._playing():
+            same = direction == 0 or (
+                self._play_clock is not None
+                and self._play_clock.direction == (1 if direction > 0 else -1)
+            )
+            self._stop_playback(settle=same)
+            if same:
+                return
+        self._start_playback(direction or 1)
+
+    def _start_playback(self, direction=1):
+        if self._view_frame is None or not self._preview_mode:
+            return
+        self._settle_timer.stop()
+        fps = float(self.fps_spin.value())
+        self._play_clock = PlaybackClock(
+            fps,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+            loop=self.loop_button.isChecked(),
+            direction=direction,
+        )
+        frame = self._play_clock.start(self._view_frame)
+        self._play_shown = 0
+        self._play_held = 0
+        self._play_stats_time = time.monotonic()
+        # Tick at twice the frame rate so frames land close to on time.
+        self._play_timer.start(max(1, int(500.0 / fps)))
+        self._sync_play_buttons()
+        self._show_frame(frame, direction=direction, playing=True)
+
+    def _stop_playback(self, settle=True):
+        if not self._playing():
+            return
+        self._play_timer.stop()
+        self._sync_play_buttons()
+        if settle:
+            self._settle_frame(self._view_frame)
+
+    def _playback_tick(self):
+        if not self.isVisible() or self._play_clock is None:
+            self._stop_playback(settle=False)
+            return
+        clock = self._play_clock
+        target, finished = clock.target()
+        frame, rebase = playback_step(
+            self._view_frame,
+            target,
+            lambda f: self._preview.pixmap(f) is not None,
+            clock.direction,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+            loop=clock.loop,
+        )
+        if rebase:
+            # Decoding is behind: play every frame at decode speed, don't skip.
+            clock.rebase(frame if frame is not None else self._view_frame)
+            self._play_held += 1
+        if frame is not None:
+            self._show_frame(frame, direction=clock.direction, playing=True)
+        elif rebase:
+            # Keep prefetch pointed at what playback needs next.
+            self._request_around(self._view_frame, clock.direction)
+
+        now = time.monotonic()
+        if now - self._play_stats_time >= 1.0:
+            shown = self._play_shown / (now - self._play_stats_time)
+            self.workspace_status.setText(
+                f"Playing {self._play_clock.fps:g} fps • showing {shown:.1f} fps"
+                + (" • waiting for frames to load" if self._play_held else "")
+            )
+            self._play_shown = 0
+            self._play_held = 0
+            self._play_stats_time = now
+
+        if finished and self._view_frame == target:
+            self._stop_playback()
+
+    def _sync_play_buttons(self):
+        playing = self._playing()
+        direction = self._play_clock.direction if self._play_clock else 1
+        self.play_button.setIcon(icons.icon("pause" if playing and direction > 0 else "play"))
+        self.play_back_button.setIcon(icons.icon("pause" if playing and direction < 0 else "play_back"))
+
+    def _frame_field_changed(self, frame):
+        if frame == self._view_frame:
+            return
+        self._stop_playback(settle=False)
+        self._show_frame(int(frame), settle=True)
+
+    def _step(self, delta):
+        self._stop_playback(settle=False)
+        if self._view_frame is None:
+            return
+        frame = step_frame(
+            self._view_frame,
+            delta,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+        )
+        # Settles after a short pause, so holding a key steps smoothly.
+        self._show_frame(frame, direction=1 if delta > 0 else -1)
+
+    def _go_to_end(self, which):
+        self._stop_playback(settle=False)
+        frame = self.timeline.last_frame if which > 0 else self.timeline.first_frame
+        self._show_frame(frame, settle=True)
+
+    def _clear_frame_cache(self):
+        self._stop_playback(settle=False)
+        self._preview.cancel_all()
+        self._preview.cache.clear()
+        self._preview.failed.clear()
+        self._preview.errors.clear()
+        self._preview.full = None
+        self._update_cache_bar()
+        self._settle_frame(self._view_frame)
+
+    def _shutdown_preview(self, *_args):
+        try:
+            self._play_timer.stop()
+            self._settle_timer.stop()
+            self._sharp_timer.stop()
+            self._preview.shutdown()
+            if self._frame_server is not None:
+                self._frame_server.close()
+                self._frame_server = None
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Surface editor
@@ -2022,6 +3456,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._refresh_timeline()
 
     def _canvas_surfaces_changed(self, surfaces):
+        QtCore.QTimer.singleShot(0, self._refresh_workflow)
         self._commit_surfaces()
 
     def _canvas_selection_changed(self, index):
@@ -2340,6 +3775,26 @@ class AutoLensDialog(QtWidgets.QDialog):
                     0,
                     self.enter_background_mode,
                 )
+
+            activation_change = getattr(
+                QtCore.QEvent,
+                "ActivationChange",
+                getattr(
+                    getattr(QtCore.QEvent, "Type", object()),
+                    "ActivationChange",
+                    None,
+                ),
+            )
+            if (
+                activation_change is not None
+                and event.type() == activation_change
+                and self.isActiveWindow()
+                and self.sidebar.currentIndex() == self.masks_tab_index
+            ):
+                # The mask may have been re-keyed in Nuke while we were away;
+                # the signature check refills only if it was.
+                QtCore.QTimer.singleShot(
+                    0, lambda: self._refresh_mask_preview(force=True))
         except Exception:
             pass
 
@@ -2355,8 +3810,10 @@ class AutoLensDialog(QtWidgets.QDialog):
             percent,
         )
         self.workspace_status.setText(
-            f"{stage} — {int(percent)}%"
+            self.panel.runner.progress_text() or f"{stage} — {int(percent)}%"
         )
+        self._last_percent = int(percent)
+        self._refresh_workflow()
 
     def _finished(self, exit_code):
         if exit_code == 0:
@@ -2365,15 +3822,39 @@ class AutoLensDialog(QtWidgets.QDialog):
                 "Complete",
                 100,
             )
-            self.workspace_status.setText("AutoLens solve complete.")
+            timing = getattr(self.panel, "last_run_timing", None) or {}
+            took = ux.track_time_text(timing)
+            what = "Geometry build" if getattr(self.panel, "_run_kind", "track") == "geometry" else "Track"
+            if took and timing.get("prep") is not None:
+                self.workspace_status.setText(
+                    f"{what} complete in {took} (Nuke prep {ux.format_duration(timing['prep'])})."
+                )
+            else:
+                self.workspace_status.setText(f"{what} complete" + (f" in {took}." if took else "."))
+            # Track -> Draw -> Output: move on once the track lands. A
+            # geometry build or an auto Create All goes straight to Output.
+            if self._step == "track":
+                surfaces = len(self.canvas.surfaces or [])
+                created = bool(getattr(self.panel, "_imported", False))
+                self._set_step("output" if created else ux.next_step_after_solve(surfaces))
+            elif self._step == "draw" and getattr(self.panel, "_imported", False):
+                self._set_step("output")
         else:
             set_status(
                 self.controller_node,
                 "Stopped / failed",
             )
-            self.workspace_status.setText(
-                "AutoLens stopped or failed. See the Solve tab log."
-            )
+            failure = getattr(self.panel, "last_failure", None)
+            if failure:
+                self.workspace_status.setText(
+                    f"{failure['title']}. {failure['next_step']}"
+                )
+            else:
+                self.workspace_status.setText(
+                    "AutoLens stopped or failed. See View > Log."
+                )
+        self._last_percent = 0
+        self._set_step(self._step)
 
     def closeEvent(self, event):
         if self.panel.runner.is_running():
@@ -2427,23 +3908,25 @@ def show_autolens_dialog(controller_node):
         return existing
 
     try:
-        dialog = AutoLensDialog(controller_node)
+        with timed("dialog: construct"):
+            dialog = AutoLensDialog(controller_node)
     except Exception as exc:
         # Include the exception type; much more useful than Nuke's generic popup.
         import traceback
         details = traceback.format_exc()
-        nuke.tprint("[AutoLens] Failed to open workspace:\\n" + details)
+        nuke.tprint("[AutoLens] Failed to open workspace:\n" + details)
         nuke.message(
-            "AutoLens could not open the workspace.\\n\\n"
-            f"{type(exc).__name__}: {exc}\\n\\n"
+            "AutoLens could not open the workspace.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
             "The full traceback was printed to Nuke's Script Editor."
         )
         return None
 
     _DIALOGS[key] = dialog
-    dialog.showMaximized()
-    dialog.raise_()
-    dialog.activateWindow()
+    with timed("dialog: show window"):
+        dialog.showMaximized()
+        dialog.raise_()
+        dialog.activateWindow()
 
     # Apply the preferred sidebar width after the maximize/layout pass. Qt can
     # otherwise preserve the constructor-time splitter ratio.
@@ -2451,11 +3934,29 @@ def show_autolens_dialog(controller_node):
         QtCore.QTimer.singleShot(
             0,
             lambda d=dialog: d.main_splitter.setSizes([
-                max(700, d.width() - 500),
-                500,
+                max(700, d.width() - 310),
+                310,
             ]),
         )
     except Exception:
         pass
+
+    # Plate preview, surfaces, masks and timeline, once the window is up.
+    # A no-op when AUTOLENS_DEFER_PREVIEW=0 already loaded them.
+    def _deferred_initial_load(d=dialog):
+        try:
+            QtWidgets.QApplication.processEvents()
+            d._initial_load()
+        except Exception as exc:
+            if "already deleted" in str(exc):
+                # The window was closed before the timer fired.
+                return
+            import traceback
+            nuke.tprint(
+                "[AutoLens] Workspace preview failed to load:\n"
+                + traceback.format_exc()
+            )
+
+    QtCore.QTimer.singleShot(0, _deferred_initial_load)
 
     return dialog

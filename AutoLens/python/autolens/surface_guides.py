@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import tempfile
 from pathlib import Path
 
 import nuke
 import nuke.rotopaint as rp
+
+from . import __version__
 
 GUIDE_NODE_NAME = "AUTOLENS_SURFACE_GUIDES"
 INTERNAL_GUIDE_NODE_NAME = "AUTOLENS_SURFACE_GUIDES_INTERNAL"
@@ -599,7 +602,7 @@ def ensure_guide_node(source_read=None, controller=None, show=True):
                     name=INTERNAL_GUIDE_NODE_NAME
                 )
                 node["label"].setValue(
-                    "AUTOLENS SURFACE GUIDES\\n"
+                    "AUTOLENS SURFACE GUIDES\n"
                     "Private guide storage"
                 )
                 node["tile_color"].setValue(0x3B6E8FFF)
@@ -685,7 +688,7 @@ def ensure_guide_node(source_read=None, controller=None, show=True):
             name=_guide_name_for_controller(controller)
         )
         node["label"].setValue(
-            "AUTOLENS SURFACE GUIDES\\n"
+            "AUTOLENS SURFACE GUIDES\n"
             "Draw rough Floor / Wall / Surface shapes here"
         )
         node["tile_color"].setValue(0x3B6E8FFF)
@@ -794,9 +797,14 @@ def _sample_roto_shape(shape, frame):
     Bake the actual evaluated Roto outline, so layer/shape transforms and Bezier
     handles are reflected in the exported guide rather than only raw CV centers.
     """
-    count = max(12, min(48, max(4, len(shape)) * 4))
-    curve = shape.evaluate(0, float(frame))
-    points = [_xy(curve.getPoint(i / float(count))) for i in range(count)]
+    # A shape with no or one CV can raise here; callers skip anything under three
+    # points, so an unusable shape must not abort the whole export or reload.
+    try:
+        count = max(12, min(48, max(4, len(shape)) * 4))
+        curve = shape.evaluate(0, float(frame))
+        points = [_xy(curve.getPoint(i / float(count))) for i in range(count)]
+    except Exception:
+        return []
 
     # Closed-curve simplification: temporarily duplicate the first point, run
     # RDP, then remove a duplicate endpoint if one remains.
@@ -809,7 +817,17 @@ def _sample_roto_shape(shape, frame):
         ) < 0.01:
             simplified = simplified[:-1]
 
-    return simplified if len(simplified) >= 3 else points
+    # Fewer than three points after simplification means a line or a dot, which
+    # would export as a zero-area guide.
+    return simplified if len(simplified) >= 3 else []
+
+
+def _write_json_atomic(path, payload):
+    """Write JSON through a temp file so a crash never leaves a half-written file."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(path))
 
 
 def _evaluated_source_filename(read_node, frame):
@@ -912,7 +930,7 @@ def export_surface_guides(output_folder, source_read_fullname=None, controller=N
     unique_frames = sorted(set(used_frames))
 
     payload = {
-        "version": "0.10.30",
+        "version": __version__,
         "coordinate_system": "nuke_bottom_left_pixels",
         "frame": int(primary["guide_frame"]),
         "frame_requested": int(primary["frame_requested"]),
@@ -936,13 +954,7 @@ def export_surface_guides(output_folder, source_read_fullname=None, controller=N
     output = Path(output_folder)
     output.mkdir(parents=True, exist_ok=True)
     path = output / "autolens_surface_guides.json"
-    path.write_text(
-        json.dumps(
-            payload,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    _write_json_atomic(path, payload)
     return path
 
 
@@ -1279,7 +1291,7 @@ def restore_surface_guides_from_output(
 
     try:
         node["label"].setValue(
-            "AUTOLENS SURFACE GUIDES\\n"
+            "AUTOLENS SURFACE GUIDES\n"
             f"Restored from {path.parent.name} • frame {frame}"
         )
     except Exception:

@@ -1,10 +1,10 @@
 @echo off
 setlocal
-title AutoLens NukeX v0.10.30 Installer
+title AutoLens NukeX v0.11.0 Installer
 
 echo.
 echo ================================================================
-echo AutoLens NukeX v0.10.30 Installer
+echo AutoLens NukeX v0.11.0 Installer
 echo ================================================================
 echo.
 echo This window should remain open until you press Enter at the end.
