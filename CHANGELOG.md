@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Faster solves.** Shots over 60 frames are matched sequentially (each frame against its
+  next 20 frames plus frames 32, 64, 128… ahead) instead of exhaustively. That is about 6x fewer
+  image pairs at 250 frames. If sequential matching registers under 90% of the frames, AutoLens
+  adds the full exhaustive matches and solves again, so shots the old matcher could solve still
+  solve. Frames whose names don't sort in frame order (unpadded numbers) stay exhaustive.
+- The incremental mapper runs global bundle adjustment half as often during the solve
+  (`ba_global_*_ratio` 1.2). The final global adjustment is unchanged.
+- Dense reconstruction only undistorts the views it uses (typically 8–18) instead of every
+  registered frame, and falls back to all frames if COLMAP needs them.
+- Faster engine-side Python: sparse-model parsing, dense view selection (same picks),
+  proxy-mesh reading, triangle adjacency and mesh-fit plane growing.
+- **Timing summary.** The log ends with a per-stage wall-clock table, and
+  `autolens_result.json` stores it under `timings`.
+- Optional speed settings are passed to COLMAP only if `colmap <command> -h` lists them.
+  `AUTOLENS_SPEED_PROFILE=legacy` (or `--speed-profile legacy`) restores the previous pipeline
+  for A/B comparisons.
 - **Build label for test installs.** Installing from a git checkout records the branch, commit,
   pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
   shows it next to the version, e.g. `AutoLens 0.10.30 (PR #8 · d9bf93a)`. Release installs show
