@@ -1777,7 +1777,7 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         if is_masks:
             self._reload_masks()
-            self._refresh_mask_preview()
+            self._refresh_mask_preview(force=True)
         else:
             self.canvas.clear_mask_overlay()
             self.canvas.update()
@@ -1845,6 +1845,7 @@ class AutoLensDialog(QtWidgets.QDialog):
             bool(checked),
         )
         self._reload_masks()
+        self._mask_overlays.clear()
 
         if (
             self.sidebar.currentIndex()
@@ -1858,11 +1859,24 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
 
 
-    def _refresh_mask_preview(self):
+    def _refresh_mask_preview(self, frame=None, force=False):
         if not mask_input_connected(
             self.controller_node
         ):
+            self._mask_overlays.clear()
             self.canvas.clear_mask_overlay()
+            return
+
+        if frame is None or isinstance(frame, bool):
+            # Menu actions pass Qt's `checked` flag; treat them as a full refresh.
+            force = force or isinstance(frame, bool)
+            frame = self._view_frame if self._view_frame is not None else int(nuke.frame())
+        frame = int(frame)
+        if force:
+            self._mask_overlays.clear()
+        cached = self._mask_overlays.get(frame)
+        if cached is not None:
+            self.canvas.set_mask_overlay(cached, visible=True)
             return
 
         self.workspace_status.setText(
@@ -1873,8 +1887,9 @@ class AutoLensDialog(QtWidgets.QDialog):
         try:
             overlay = render_mask_overlay_pixmap(
                 self.controller_node,
-                int(nuke.frame()),
+                frame,
             )
+            self._mask_overlays[frame] = overlay
             self.canvas.set_mask_overlay(
                 overlay,
                 visible=True,
@@ -2459,6 +2474,7 @@ class AutoLensDialog(QtWidgets.QDialog):
     def _build_playback_bar(self, layout):
         """Transport controls under the timeline, plus the frame cache."""
         self._view_frame = None
+        self._mask_overlays = {}  # frame -> overlay pixmap for the connected mask
         self._view_exact = False
         self._displayed_frame = None
         self._preview_mode = None          # "qt", "server" or None
@@ -2854,6 +2870,14 @@ class AutoLensDialog(QtWidgets.QDialog):
             self.frame_field.blockSignals(False)
         self.canvas.set_current_frame(frame)
         self._preview.protect = {frame}
+        if self.canvas.show_mask_overlay:
+            # Never show another frame's mask: an uncached frame shows none
+            # until it settles and its overlay is sampled.
+            overlay = self._mask_overlays.get(frame)
+            self.canvas.set_mask_overlay(
+                overlay if overlay is not None else QtGui.QPixmap(),
+                visible=True,
+            )
 
         pixmap = self._preview.pixmap(frame)
         if pixmap is not None:
@@ -2949,7 +2973,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         if refresh_surfaces:
             self._reload_surfaces()
             if self.sidebar.currentIndex() == self.masks_tab_index:
-                self._refresh_mask_preview()
+                self._refresh_mask_preview(frame)
 
         pixmap = self._preview.pixmap(frame)
         if pixmap is not None:
@@ -3592,6 +3616,26 @@ class AutoLensDialog(QtWidgets.QDialog):
                     0,
                     self.enter_background_mode,
                 )
+
+            activation_change = getattr(
+                QtCore.QEvent,
+                "ActivationChange",
+                getattr(
+                    getattr(QtCore.QEvent, "Type", object()),
+                    "ActivationChange",
+                    None,
+                ),
+            )
+            if (
+                activation_change is not None
+                and event.type() == activation_change
+                and self.isActiveWindow()
+                and self._mask_overlays
+            ):
+                # The mask may have been re-keyed in Nuke while we were away.
+                self._mask_overlays.clear()
+                if self.sidebar.currentIndex() == self.masks_tab_index:
+                    QtCore.QTimer.singleShot(0, self._refresh_mask_preview)
         except Exception:
             pass
 

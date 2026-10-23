@@ -606,61 +606,35 @@ def _mask_alpha_channel(node):
     return "alpha"
 
 
-def _sample_node_value(
-    node,
-    channel,
-    x,
-    y,
-):
-    """
-    Sample a node without invoking nuke.execute/Write.
+def resolve_sampler(node, channel, frame=None, probe=(0.5, 0.5)):
+    """A fast (x, y) -> value sampler using the first sample() form that works.
 
-    Nuke builds expose slightly different sample signatures, so try the common
-    forms. The current Nuke frame is set by the caller.
+    Tries the frame-explicit forms first, once, at `probe`, so the per-pixel
+    loop doesn't pay for failed calls on every pixel.
     """
-    sample = getattr(
-        node,
-        "sample",
-        None,
-    )
-
+    sample = getattr(node, "sample", None)
     if sample is None:
         raise RuntimeError(
             "Connected mask node does not expose the Nuke sample() API."
         )
-
-    attempts = (
-        lambda: sample(
-            channel,
-            float(x),
-            float(y),
-        ),
-        lambda: sample(
-            channel,
-            float(x),
-            float(y),
-            1,
-            1,
-        ),
-    )
-
+    forms = []
+    if frame is not None:
+        f = int(frame)
+        forms.append(lambda x, y: sample(channel, float(x), float(y), 1, 1, f))
+        forms.append(lambda x, y: sample(channel, float(x), float(y), frame=f))
+    forms.append(lambda x, y: sample(channel, float(x), float(y)))
+    forms.append(lambda x, y: sample(channel, float(x), float(y), 1, 1))
     last_error = None
-
-    for attempt in attempts:
+    for form in forms:
         try:
-            return float(
-                attempt()
-            )
+            float(form(*probe))
         except Exception as exc:
             last_error = exc
-
+            continue
+        return lambda x, y, form=form: float(form(x, y))
     raise RuntimeError(
         "Could not sample connected mask alpha."
-        + (
-            f" {last_error}"
-            if last_error is not None
-            else ""
-        )
+        + (f" {last_error}" if last_error is not None else "")
     )
 
 
@@ -767,6 +741,13 @@ def render_mask_overlay_pixmap(
             int(frame)
         )
 
+        sampler = resolve_sampler(
+            mask_source,
+            channel,
+            frame,
+            probe=(source_width * 0.5, source_height * 0.5),
+        )
+
         # Pixel-center sampling in the source raster. Nuke image coordinates
         # are bottom-left based; QImage rows are top-down, so flip Y.
         for py in range(
@@ -803,9 +784,7 @@ def render_mask_overlay_pixmap(
                     )
                 )
 
-                alpha = _sample_node_value(
-                    mask_source,
-                    channel,
+                alpha = sampler(
                     source_x,
                     source_y,
                 )
