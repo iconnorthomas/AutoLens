@@ -286,6 +286,66 @@ def install_plugin(source: Path, target: Path, nuke_dir: Path):
 
     log(f"Plugin installed to:\n  {target}")
 
+    info = build_info_from_git(source.parent)
+    build_file = target / "autolens_build.json"
+    if info:
+        build_file.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        log(f"Build: {info.get('branch')} {info.get('commit')}"
+            + (f" (PR #{info['pr']})" if info.get("pr") else ""))
+    elif build_file.exists():
+        build_file.unlink()
+
+
+GITHUB_REPO = "iconnorthomas/AutoLens"
+
+
+def _git(repo: Path, *args):
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def find_pr_number(branch, fetch=None):
+    """The newest GitHub pull request for this branch, or None (offline, or no PR)."""
+    if not branch or branch == "HEAD":
+        return None
+    owner = GITHUB_REPO.split("/")[0]
+    url = (f"https://api.github.com/repos/{GITHUB_REPO}/pulls"
+           f"?head={owner}:{branch}&state=all&per_page=1")
+    try:
+        if fetch is None:
+            req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        else:
+            data = fetch(url)
+    except Exception:
+        return None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0].get("number")
+    return None
+
+
+def build_info_from_git(repo: Path, git=None, fetch=None):
+    """{branch, commit, dirty, pr} when installing from a git checkout, else {}."""
+    git = git or (lambda *args: _git(repo, *args))
+    commit = git("rev-parse", "--short", "HEAD")
+    if not commit:
+        return {}
+    branch = git("rev-parse", "--abbrev-ref", "HEAD") or ""
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "branch": branch,
+        "commit": commit,
+        "dirty": bool(status),
+        "pr": find_pr_number(branch, fetch),
+    }
+
 
 def setup_python_runtime(target: Path):
     save_report("python-runtime")
