@@ -26,6 +26,25 @@
   `Path | None` annotation, which Python 3.9 can't evaluate, so the AutoLens menu never
   appeared. The new CI runs the tests on Python 3.9, 3.10 and 3.11.
 - `RELEASE_NOTES.md` is now this CHANGELOG. The one-off `GITHUB_PUBLISHING.md` checklist is gone.
+- **Code audit** (`docs/AUDIT.md`): ranked findings across the plugin, engine and installer, with
+  a roadmap of follow-up PRs. Small fixes from it:
+  - **Fix: Import Result could leave the Redistort node unwired.** The importer matched node
+    names by prefix, so `AUTOLENS_REDISTORT` could resolve to the `AUTOLENS_REDISTORT_INPUT` Dot,
+    which is then deleted.
+  - **Fix: the installer could delete the plugin it was installing** when the package was
+    unzipped into `~/.nuke`, or inside `~/.nuke/AutoLens`. It now installs in place or stops
+    with a clear message.
+  - **Fix: an interrupted upgrade no longer loses the managed runtimes.** The installer used to
+    delete `.autolens_upgrade_preserve` (the parked `.venv`, Miniforge and COLMAP environments)
+    at the start of the next run. It now moves them back, including when the copy fails part-way.
+  - **Fix: installer steps could fail on non-ASCII tool output, and timeouts never fired.** pip
+    and conda output is decoded as UTF-8 with replacement, and a watchdog enforces the step
+    timeout while a child process holds its output open.
+  - **Fix: stale frames in the square-pixel solve proxy.** The proxy cache folder is keyed only
+    by size and pixel aspect, so a different or shorter plate re-rendered into it kept the old
+    extra frames, and the solve used them.
+  - Degenerate Roto shapes (no curve, or a line) are skipped instead of aborting the guide export
+    or exporting a zero-area guide. The surface-guide JSON is written atomically.
 
 ## 0.10.30 - 2026-09-13
 

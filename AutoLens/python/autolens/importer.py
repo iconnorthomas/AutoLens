@@ -159,11 +159,24 @@ def _upgrade_tracking_space_labels(nk_text: str) -> str:
 
 
 
+def _is_named(node, base_name):
+    """True when a node is named base_name, or base_name plus Nuke's numeric suffix.
+
+    A plain prefix match is not enough: AUTOLENS_REDISTORT would also match the
+    AUTOLENS_REDISTORT_INPUT Dot.
+    """
+    try:
+        name = node.name()
+    except Exception:
+        return False
+    return re.fullmatch(re.escape(base_name) + r"\d*", name) is not None
+
+
 def _find_pasted(pasted, prefix):
     """Find a pasted node by AutoLens base-name, including Nuke numeric suffixes."""
     matches = [
         node for node in pasted
-        if node.name().startswith(prefix)
+        if _is_named(node, prefix)
     ]
     return matches[0] if matches else None
 
@@ -488,13 +501,13 @@ def import_result(
         if source is not None and source.Class() == "Read":
             for node in pasted:
                 if (
-                    node.name().startswith("AUTOLENS_UNDISTORT")
+                    _is_named(node, "AUTOLENS_UNDISTORT")
                     and node.Class() in ("LensDistortion2", "LensDistortion")
                 ):
                     node.setInput(0, source)
 
             for node in list(pasted):
-                if node.Class() == "Read" and node.name().startswith("PLATE_REPOINT_TO_SEQUENCE"):
+                if node.Class() == "Read" and _is_named(node, "PLATE_REPOINT_TO_SEQUENCE"):
                     try:
                         nuke.delete(node)
                         pasted.remove(node)
