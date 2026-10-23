@@ -255,7 +255,9 @@ The Nuke node detects versions and allows switching between them.
 
 ## Recommended
 
-Run:
+Download `AutoLens_NukeX_vX.Y.Z.zip` from the
+[latest GitHub Release](https://github.com/iconnorthomas/AutoLens/releases/latest), unzip it, and
+run:
 
 ```text
 install_autolens.bat
@@ -982,19 +984,50 @@ AutoLens/
 install_autolens.py
 install_autolens.bat
 README.md
+CHANGELOG.md
 docs/
-releases/
+scripts/release.py
+tests/
+.github/workflows/
 ```
 
 ---
 
-# Release Build
+# Development
 
-The packaged release is included at:
+## Tests
 
-```text
-releases/AutoLens_NukeX_v0.10.30_PerSurfaceGuideFrames.zip
+The unit tests need only Python 3.9+ with numpy and OpenEXR (no Nuke, GPU or COLMAP):
+
+```bash
+python -m pip install numpy OpenEXR
+python -m unittest discover -s tests -v
 ```
+
+GitHub runs them on every pull request (Windows on Python 3.9, 3.10 and 3.11, matching Nuke 14-17,
+and Linux on 3.11). `main` is protected: changes land through pull requests whose tests and
+**Version check** pass.
+
+## Version numbers and releases
+
+A version number isn't a version until it's posted as a GitHub Release, and several branches can
+be open at once, so:
+
+- **Feature and fix branches never change `__version__`** (in `AutoLens/python/autolens/__init__.py`).
+  They add their notes under `## Unreleased` in CHANGELOG.md.
+- **A release is its own branch and PR.** On a fresh branch from `main`, run
+  `python scripts/release.py bump X.Y.Z`. It sets `__version__` and the installer's version, and
+  moves the Unreleased notes under `## X.Y.Z - <today>`. The PR's **Version check** fails if the
+  number isn't higher than `main` and every posted release (for example, another branch got
+  there first), if the installer disagrees, or if the CHANGELOG wasn't updated.
+- **Posting:** after the release PR merges, tag the merge commit on `main` and push the tag:
+  `git tag vX.Y.Z` then `git push origin vX.Y.Z`. The *Release* workflow checks the tag again (it
+  must match `__version__` in that commit, be on `main`, be newer than every earlier release, and
+  have CHANGELOG notes) and runs the tests. It then **builds `AutoLens_NukeX_vX.Y.Z.zip` from that
+  exact commit**, checks it holds the plugin, the installer and this version, and posts the GitHub
+  Release with the CHANGELOG notes and the zip. If any check fails, nothing is posted: delete the
+  tag, fix it, and tag again.
+- Release zips are never committed (`releases/` and `dist/` are git-ignored).
 
 ---
 
