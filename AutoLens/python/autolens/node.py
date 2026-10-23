@@ -43,7 +43,8 @@ _KNOB_TOOLTIPS = {
     ),
     "autolens_run_mode": (
         "Resume reuses every cached stage that is still valid. Rebuild dense only "
-        "keeps the camera solve. Rebuild everything starts the version from scratch."
+        "keeps the camera solve. Rebuild everything starts the version from scratch. "
+        "Camera only delivers the camera and lens fast; Resume later adds the geometry."
     ),
     "autolens_use_guides": "Fit a projection plane to each surface drawn in the workspace.",
     "autolens_auto_import": "Run Create All automatically when a solve finishes.",
@@ -691,7 +692,8 @@ def _add_knobs(node, source_read=None):
 
     mode = nuke.Enumeration_Knob(
         "autolens_run_mode", "Run mode",
-        ["Resume / reuse cached stages", "Rebuild dense only", "Rebuild everything"]
+        ["Resume / reuse cached stages", "Rebuild dense only", "Rebuild everything",
+         "Camera only (geometry later)"]
     )
     node.addKnob(mode)
 
