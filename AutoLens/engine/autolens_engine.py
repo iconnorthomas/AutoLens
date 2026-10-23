@@ -238,6 +238,43 @@ def _windows_status(returncode: int) -> str:
     return f"0x{int(returncode) & 0xFFFFFFFF:08X}"
 
 
+# Wall-clock time of every COLMAP command and Python stage in this run, in
+# order. Printed as a summary at the end and stored in autolens_result.json so
+# two runs of the same shot can be compared stage by stage.
+STAGE_TIMINGS: list[dict] = []
+
+
+def record_timing(name: str, seconds: float) -> None:
+    STAGE_TIMINGS.append({"stage": str(name), "seconds": round(float(seconds), 3)})
+    print(f"\n[AUTOLENS TIMING] {name}: {format_duration(seconds)}")
+
+
+class stage_timer:
+    """Context manager that records the wall-clock time of a Python stage."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.started = 0.0
+
+    def __enter__(self):
+        self.started = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        record_timing(self.name, time.perf_counter() - self.started)
+        return False
+
+
+def print_timing_summary(total_seconds: float) -> None:
+    if not STAGE_TIMINGS:
+        return
+    print("\n[AUTOLENS TIMING SUMMARY]")
+    for item in STAGE_TIMINGS:
+        share = 100.0 * item["seconds"] / max(total_seconds, 1.0e-9)
+        print(f"  {item['stage']:<34} {format_duration(item['seconds']):>12}  {share:5.1f}%")
+    print(f"  {'total':<34} {format_duration(total_seconds):>12}")
+
+
 def run(cmd: list[str], cwd: Path | None = None, label: str | None = None) -> None:
     print("\n>>>", " ".join(f'"{x}"' if " " in str(x) else str(x) for x in cmd))
     started = time.perf_counter()
@@ -247,7 +284,7 @@ def run(cmd: list[str], cwd: Path | None = None, label: str | None = None) -> No
 
     elapsed = time.perf_counter() - started
     stage_name = label or (cmd[1] if len(cmd) > 1 else cmd[0])
-    print(f"\n[AUTOLENS TIMING] {stage_name}: {format_duration(elapsed)}")
+    record_timing(stage_name, elapsed)
 
     if proc.returncode != 0:
         code = _windows_status(proc.returncode)
@@ -274,8 +311,63 @@ def run_try(cmd: list[str], cwd: Path | None = None, label: str | None = None) -
 
     elapsed = time.perf_counter() - started
     stage_name = label or (cmd[1] if len(cmd) > 1 else cmd[0])
-    print(f"\n[AUTOLENS TIMING] {stage_name}: {format_duration(elapsed)}")
+    record_timing(stage_name, elapsed)
     return proc.returncode == 0
+
+
+_COLMAP_HELP_CACHE: dict = {}
+
+
+def colmap_supported_options(colmap: str, subcommand: str) -> set:
+    """
+    Return the --Section.option names a COLMAP subcommand accepts, read from
+    its -h output. Option names move between COLMAP releases, so optional
+    speed settings are only passed when the installed COLMAP lists them. Any
+    failure returns an empty set, which means "pass nothing optional".
+    """
+    key = (str(colmap), str(subcommand))
+    if key in _COLMAP_HELP_CACHE:
+        return _COLMAP_HELP_CACHE[key]
+
+    supported = set()
+    try:
+        argv, actual_cwd, env = prepare_colmap_command([colmap, subcommand, "-h"])
+        proc = subprocess.run(
+            argv,
+            cwd=actual_cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+        supported = parse_colmap_help_options((proc.stdout or "") + "\n" + (proc.stderr or ""))
+    except Exception as exc:
+        print(f"[AUTOLENS] Could not read '{subcommand} -h' ({exc}); using COLMAP defaults.")
+
+    _COLMAP_HELP_CACHE[key] = supported
+    return supported
+
+
+def parse_colmap_help_options(text: str) -> set:
+    return set(re.findall(r"--([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)?)", text or ""))
+
+
+def select_supported_options(wanted, supported) -> list[str]:
+    """
+    Turn [(names, value), ...] into a COLMAP argument list, keeping only
+    options the installed COLMAP supports. `names` is one option name or a
+    tuple of alternative spellings across COLMAP versions, tried in order.
+    """
+    args = []
+    for names, value in wanted:
+        if isinstance(names, str):
+            names = (names,)
+        for name in names:
+            if name in supported:
+                args += [f"--{name}", str(value)]
+                break
+    return args
 
 
 def find_images(folder: Path) -> list[Path]:
@@ -982,6 +1074,45 @@ def read_ply_vertices(path: Path):
         return np.column_stack([arr['x'].astype(np.float64),arr['y'].astype(np.float64),arr['z'].astype(np.float64)])
 
 
+def _read_binary_triangle_faces(f, props, count, endian):
+    """
+    Read a binary PLY face element in one numpy call, assuming every face is
+    a triangle (what COLMAP's meshers, mesh_simplifier and write_ply_mesh
+    produce). Returns the faces as a list of [a, b, c] lists, or None after
+    rewinding the file when the element doesn't fit that layout, so the
+    caller can fall back to its per-value reader.
+    """
+    start = f.tell()
+    fields = []
+    index_field = None
+    for i, p in enumerate(props):
+        if p['kind'] == 'scalar':
+            fields.append((f's{i}', endian + PLY_SCALAR_TYPES[p['type']][1]))
+        else:
+            fields.append((f'n{i}', endian + PLY_SCALAR_TYPES[p['count_type']][1]))
+            fields.append((f'v{i}', endian + PLY_SCALAR_TYPES[p['item_type']][1], (3,)))
+            if p['name'] in ('vertex_indices', 'vertex_index'):
+                index_field = i
+    if index_field is None:
+        return None
+    try:
+        records = np.fromfile(f, dtype=np.dtype(fields), count=count)
+    except Exception:
+        records = None
+    triangles_only = (
+        records is not None
+        and len(records) == count
+        and all(
+            np.all(records[f'n{i}'] == 3)
+            for i, p in enumerate(props) if p['kind'] != 'scalar'
+        )
+    )
+    if not triangles_only:
+        f.seek(start)
+        return None
+    return records[f'v{index_field}'].astype(np.int64).tolist()
+
+
 def read_ply_mesh(path: Path):
     fmt,elements,offset=read_ply_header(path); vertices=None; faces=[]
     with path.open('rb') as f:
@@ -1000,6 +1131,10 @@ def read_ply_mesh(path: Path):
                     arr=np.fromfile(f,dtype=dtype,count=elem['count'])
                     vertices=np.column_stack([arr['x'].astype(np.float64),arr['y'].astype(np.float64),arr['z'].astype(np.float64)])
             elif elem['name']=='face':
+                if fmt!='ascii':
+                    fast=_read_binary_triangle_faces(f,props,elem['count'],_endian_prefix(fmt))
+                    if fast is not None:
+                        faces=fast; continue
                 for _ in range(elem['count']):
                     face=None
                     if fmt=='ascii':
@@ -1261,35 +1396,19 @@ def cleanup_proxy_spanning_triangles(
         cap,
     )
 
-    local_sum = np.zeros(
-        len(vertices),
-        dtype=np.float64,
+    # bincount adds in input order, like the np.add.at calls it replaced
+    # (first endpoints, then second endpoints), so the sums are identical,
+    # but it runs as one pass instead of numpy's slow unbuffered add.at.
+    endpoint_ids = np.concatenate([edge_pairs[:, 0], edge_pairs[:, 1]])
+    local_sum = np.bincount(
+        endpoint_ids,
+        weights=np.concatenate([capped_lengths, capped_lengths]),
+        minlength=len(vertices),
     )
-    local_count = np.zeros(
-        len(vertices),
-        dtype=np.int64,
-    )
-
-    np.add.at(
-        local_sum,
-        edge_pairs[:, 0],
-        capped_lengths,
-    )
-    np.add.at(
-        local_sum,
-        edge_pairs[:, 1],
-        capped_lengths,
-    )
-    np.add.at(
-        local_count,
-        edge_pairs[:, 0],
-        1,
-    )
-    np.add.at(
-        local_count,
-        edge_pairs[:, 1],
-        1,
-    )
+    local_count = np.bincount(
+        endpoint_ids,
+        minlength=len(vertices),
+    ).astype(np.int64)
 
     vertex_scale = np.full(
         len(vertices),
@@ -1424,6 +1543,7 @@ def ensure_clean_proxy_mesh(
         "\n[AUTOLENS PROXY CLEANUP] "
         "Removing unsupported spanning / needle triangles..."
     )
+    cleanup_started = time.perf_counter()
 
     vertices, faces = read_ply_mesh(
         source_proxy
@@ -1486,6 +1606,7 @@ def ensure_clean_proxy_mesh(
         f"{report['input_triangles']:,} triangle(s) "
         f"({report['removed_fraction'] * 100.0:.2f}%)."
     )
+    record_timing("proxy_cleanup", time.perf_counter() - cleanup_started)
 
     return clean_proxy, report
 
@@ -1850,6 +1971,31 @@ def find_cached_sparse_root(output: Path, cache: dict | None) -> Path | None:
     return None
 
 
+def parse_xy_id_triples(points_line: str):
+    """
+    Parse a COLMAP images.txt POINTS2D line ("X Y POINT3D_ID ...") in one
+    numpy call and keep the triangulated observations (POINT3D_ID >= 0).
+
+    Returns (xs, ys, point_ids) arrays, or None when the line has a value
+    numpy can't parse, so callers can fall back to their per-triple loop.
+    A trailing incomplete triple is ignored, as in the per-triple loop.
+    """
+    values = points_line.split()
+    usable = (len(values) // 3) * 3
+    if usable == 0:
+        empty = np.zeros(0, dtype=np.float64)
+        return empty, empty, np.zeros(0, dtype=np.int64)
+    try:
+        table = np.array(values[:usable], dtype=np.float64).reshape(-1, 3)
+    except ValueError:
+        return None
+    ids = table[:, 2]
+    if not np.all(np.isfinite(table)) or np.any(ids != np.round(ids)):
+        return None
+    keep = ids >= 0
+    return table[keep, 0], table[keep, 1], ids[keep].astype(np.int64)
+
+
 def parse_image_observations(
     images_txt: Path,
     width: int,
@@ -1891,6 +2037,23 @@ def parse_image_observations(
             continue
 
         name = " ".join(parts[9:])
+
+        parsed = parse_xy_id_triples(points_line)
+        if parsed is not None:
+            xs, ys, ids = parsed
+            gx = np.clip((xs / max(width, 1)) * grid_x, 0, grid_x - 1).astype(np.int64)
+            gy = np.clip((ys / max(height, 1)) * grid_y, 0, grid_y - 1).astype(np.int64)
+            point_ids = set(ids.tolist())
+            occupied_count = int(len(np.unique(gx * grid_y + gy)))
+            result[name] = {
+                "point_ids": point_ids,
+                "point_count": len(point_ids),
+                "grid_coverage": occupied_count / float(grid_x * grid_y),
+                "occupied_grid_cells": occupied_count,
+            }
+            continue
+
+        # Slow path for lines numpy can't parse; skips malformed triples.
         point_ids = set()
         occupied = set()
         valid_xy = []
@@ -2118,16 +2281,32 @@ def choose_smart_dense_views(
         "score": quality[first],
     }]
 
+    # Per-candidate relations to the selected set, updated only against the
+    # newest selected view each round instead of recomputed against all of
+    # them. Every value equals what a full recomputation would give, so the
+    # selection is unchanged; this just removes the O(selected) inner loop
+    # of set intersections per candidate per round.
+    selected_set = {first}
+    gains = {}
+    best_overlap_by = {}
+    nearest_baseline_by = {}
+    max_forward_dot_by = {}
+    for name in names:
+        if name == first:
+            continue
+        gains[name] = len(observations[name]["point_ids"] - covered)
+        best_overlap_by[name] = _pair_geometry(
+            name, first, centers, forwards, observations, max_baseline
+        )["overlap"]
+        nearest_baseline_by[name] = float(np.linalg.norm(centers[name] - centers[first]))
+        max_forward_dot_by[name] = float(np.dot(forwards[name], forwards[first]))
+
     while len(selected) < target_frames:
-        unselected = [n for n in names if n not in selected]
+        unselected = [n for n in names if n not in selected_set]
         if not unselected:
             break
 
-        gains = {
-            n: len(observations[n]["point_ids"] - covered)
-            for n in unselected
-        }
-        max_gain = max(gains.values()) if gains else 0
+        max_gain = max(gains[n] for n in unselected)
 
         current_coverage = len(covered) / float(len(all_points))
         if (
@@ -2144,27 +2323,16 @@ def choose_smart_dense_views(
         for name in unselected:
             gain_norm = gains[name] / float(max(max_gain, 1))
 
-            pair_metrics = [
-                _pair_geometry(name, chosen, centers, forwards, observations, max_baseline)
-                for chosen in selected
-            ]
-
             # For stereo we want at least one strongly overlapping selected view.
-            best_overlap = max((m["overlap"] for m in pair_metrics), default=0.0)
+            best_overlap = best_overlap_by[name]
 
             # Geometric novelty uses distance to the nearest selected camera,
             # normalized to the shot's maximum camera baseline.
-            nearest_baseline = min(
-                (np.linalg.norm(centers[name] - centers[c]) for c in selected),
-                default=0.0,
-            )
+            nearest_baseline = nearest_baseline_by[name]
             baseline_novelty = min(1.0, float(nearest_baseline) / max_baseline)
 
             # A little orientation novelty helps orbit/handheld shots.
-            min_forward_dot = max(
-                (float(np.dot(forwards[name], forwards[c])) for c in selected),
-                default=1.0,
-            )
+            min_forward_dot = max_forward_dot_by[name]
             orientation_novelty = min(
                 1.0,
                 float(np.degrees(np.arccos(np.clip(min_forward_dot, -1.0, 1.0)))) / 45.0,
@@ -2201,6 +2369,29 @@ def choose_smart_dense_views(
         new_ids = observations[best_name]["point_ids"] - covered
         covered |= observations[best_name]["point_ids"]
         selected.append(best_name)
+        selected_set.add(best_name)
+
+        for name in names:
+            if name in selected_set:
+                continue
+            # new_ids is disjoint from the old coverage, so this is exactly
+            # len(point_ids - covered) for the enlarged coverage.
+            if new_ids:
+                gains[name] -= len(observations[name]["point_ids"] & new_ids)
+            best_overlap_by[name] = max(
+                best_overlap_by[name],
+                _pair_geometry(
+                    name, best_name, centers, forwards, observations, max_baseline
+                )["overlap"],
+            )
+            nearest_baseline_by[name] = min(
+                nearest_baseline_by[name],
+                float(np.linalg.norm(centers[name] - centers[best_name])),
+            )
+            max_forward_dot_by[name] = max(
+                max_forward_dot_by[name],
+                float(np.dot(forwards[name], forwards[best_name])),
+            )
 
         history.append({
             "name": best_name,
@@ -2425,6 +2616,20 @@ def print_dense_config(
     print("=" * 72 + "\n")
 
 
+def missing_undistorted_images(dense: Path, names: list[str]) -> list[str]:
+    images = Path(dense) / "images"
+    return [name for name in names if not (images / name).is_file()]
+
+
+def undistort_subset_in_workspace(dense: Path, poses: list[dict]) -> bool:
+    """True when the dense workspace holds fewer undistorted images than registered views."""
+    images = Path(dense) / "images"
+    if not images.is_dir():
+        return False
+    present = sum(1 for p in poses if (images / p["name"]).is_file())
+    return present < len(poses)
+
+
 def run_dense_reconstruction(
     colmap,
     images_dir,
@@ -2434,13 +2639,15 @@ def run_dense_reconstruction(
     observations,
     settings,
     force_dense=False,
+    speed_profile="fast",
 ):
     dense = output / "dense"
     settings_path = dense / "autolens_dense_settings.json"
 
     # Analyze the solved shot and choose a compact, geometrically useful set
     # of dense reference views before deciding cache compatibility.
-    selection = choose_dense_views(poses, observations, settings)
+    with stage_timer("dense_view_selection"):
+        selection = choose_dense_views(poses, observations, settings)
     selected_names = selection["selected_names"]
     requested_signature = dense_settings_signature(settings, selected_names)
 
@@ -2461,22 +2668,52 @@ def run_dense_reconstruction(
         (dense / "images").exists()
         and (dense / "sparse").exists()
         and (dense / "stereo").exists()
+        and not missing_undistorted_images(dense, selected_names)
     )
 
+    undistort_cmd = [
+        colmap, "image_undistorter",
+        "--image_path", str(images_dir),
+        "--input_path", str(best_model),
+        "--output_path", str(dense),
+        "--output_type", "COLMAP",
+        "--max_image_size", str(settings["max_image_size"]),
+    ]
+    # PatchMatch, fusion and meshing only read the dense reference views
+    # listed in patch-match.cfg / fusion.cfg, so undistorting every registered
+    # frame (often 10-20x more) is wasted time and disk. Undistort only the
+    # selected views when this COLMAP supports --image_list_path.
     if not prepared:
+        undistort_subset = (
+            speed_profile != "legacy"
+            and len(selected_names) < len(poses)
+            and "image_list_path" in colmap_supported_options(colmap, "image_undistorter")
+        )
         show_progress(
             7,
             "Preparing dense reconstruction",
-            f"Undistorting registered views at max {settings['max_image_size']} px."
+            (
+                f"Undistorting {len(selected_names)} dense reference views"
+                if undistort_subset
+                else "Undistorting registered views"
+            ) + f" at max {settings['max_image_size']} px."
         )
-        run([
-            colmap, "image_undistorter",
-            "--image_path", str(images_dir),
-            "--input_path", str(best_model),
-            "--output_path", str(dense),
-            "--output_type", "COLMAP",
-            "--max_image_size", str(settings["max_image_size"]),
-        ], label="image_undistorter")
+        if undistort_subset:
+            list_path = dense / "autolens_dense_image_list.txt"
+            list_path.write_text("\n".join(selected_names) + "\n", encoding="utf-8")
+            run(
+                undistort_cmd + ["--image_list_path", str(list_path)],
+                label="image_undistorter",
+            )
+            missing = missing_undistorted_images(dense, selected_names)
+            if missing:
+                print(
+                    f"[AUTOLENS DENSE] {len(missing)} selected view(s) were not "
+                    "undistorted from the image list; undistorting all views."
+                )
+                run(undistort_cmd, label="image_undistorter_all")
+        else:
+            run(undistort_cmd, label="image_undistorter")
     else:
         show_progress(
             7,
@@ -2568,7 +2805,25 @@ def run_dense_reconstruction(
         "--PatchMatchStereo.num_iterations", str(settings["num_iterations"]),
         "--PatchMatchStereo.num_samples", str(settings["num_samples"]),
     ]
-    run(patch_cmd, label="patch_match_stereo")
+    if undistort_subset_in_workspace(dense, poses):
+        # Safety net for the subset undistortion: if this COLMAP build wants
+        # every registered image on disk, undistort them all and run again.
+        if not run_try(patch_cmd, label="patch_match_stereo"):
+            print(
+                "[AUTOLENS DENSE] PatchMatch failed on the reduced dense workspace; "
+                "undistorting all registered views and retrying."
+            )
+            run(undistort_cmd, label="image_undistorter_all")
+            write_dense_configs(
+                dense,
+                poses,
+                observations,
+                selection,
+                settings["source_views"],
+            )
+            run(patch_cmd, label="patch_match_stereo_retry")
+    else:
+        run(patch_cmd, label="patch_match_stereo")
 
     input_type = "geometric" if settings["geom_consistency"] else "photometric"
 
@@ -2673,6 +2928,13 @@ def mesh_triangle_geometry(vertices: np.ndarray, triangles: np.ndarray):
 
 
 def triangulate_faces(faces: list[list[int]]) -> np.ndarray:
+    # Fast path: an all-triangle mesh (every COLMAP proxy) converts directly.
+    try:
+        direct=np.array(faces,dtype=np.int64)
+    except (ValueError, TypeError):
+        direct=None
+    if direct is not None and direct.ndim==2 and direct.shape[1]==3 and len(direct):
+        return direct
     triangles=[]
     for face in faces:
         for i in range(1,len(face)-1):
@@ -2683,6 +2945,31 @@ def triangulate_faces(faces: list[list[int]]) -> np.ndarray:
 
 
 def build_triangle_adjacency(triangles: np.ndarray):
+    """
+    Edge-neighbour lists per triangle. Sorts all edges once with numpy
+    instead of building a dict of edge tuples; the neighbour lists hold the
+    same faces as build_triangle_adjacency_slow, possibly in another order.
+    """
+    tri=np.asarray(triangles,dtype=np.int64).reshape(-1,3); count=len(tri)
+    if count==0: return []
+    edges=np.concatenate([tri[:,[0,1]],tri[:,[1,2]],tri[:,[2,0]]]); edges.sort(axis=1)
+    owner=np.tile(np.arange(count,dtype=np.int64),3)
+    order=np.lexsort((edges[:,1],edges[:,0])); edges=edges[order]; owner=owner[order]
+    new_group=np.ones(len(edges),dtype=bool); new_group[1:]=np.any(edges[1:]!=edges[:-1],axis=1)
+    starts=np.flatnonzero(new_group); sizes=np.diff(np.append(starts,len(edges)))
+    pair_starts=starts[sizes==2]
+    src=[owner[pair_starts]]; dst=[owner[pair_starts+1]]
+    # Non-manifold edges (3+ faces) are rare; connect every pair like the slow path.
+    for s,n in zip(starts[sizes>2].tolist(),sizes[sizes>2].tolist()):
+        ids=owner[s:s+n]; ii,jj=np.triu_indices(n,k=1); src.append(ids[ii]); dst.append(ids[jj])
+    a=np.concatenate(src); b=np.concatenate(dst)
+    src=np.concatenate([a,b]); dst=np.concatenate([b,a])
+    order=np.argsort(src,kind='stable'); neighbours=dst[order].tolist()
+    offsets=np.concatenate([[0],np.cumsum(np.bincount(src,minlength=count))]).tolist()
+    return [neighbours[offsets[i]:offsets[i+1]] for i in range(count)]
+
+
+def build_triangle_adjacency_slow(triangles: np.ndarray):
     edge_faces=defaultdict(list)
     for fi,tri in enumerate(triangles):
         for edge in (tuple(sorted((int(tri[0]),int(tri[1])))),tuple(sorted((int(tri[1]),int(tri[2])))),tuple(sorted((int(tri[2]),int(tri[0]))))):
@@ -2720,16 +3007,22 @@ def extract_meshfit_surfaces(vertices, faces, poses, angle_degrees=10.0, distanc
     triangles=triangulate_faces(faces); triangles,normals,areas,centroids=mesh_triangle_geometry(vertices,triangles); adjacency=build_triangle_adjacency(triangles)
     low=np.percentile(vertices,1.0,axis=0); high=np.percentile(vertices,99.0,axis=0); scene_diag=float(np.linalg.norm(high-low))
     tol=max(scene_diag*distance_ratio,1.0e-8); total_area=float(np.sum(areas)); min_area=total_area*min_area_fraction; cos_thr=math.cos(math.radians(angle_degrees))
-    seed_order=np.argsort(-areas); claimed=np.zeros(len(triangles),dtype=bool); surfaces=[]
+    seed_order=np.argsort(-areas).tolist(); claimed=[False]*len(triangles); surfaces=[]
+    # Region growing tests every neighbour against the seed plane; plain float
+    # maths on Python lists is several times faster here than np.dot on 3-vectors.
+    normal_list=normals.tolist(); centroid_list=centroids.tolist()
     for seed in seed_order:
         if claimed[seed]: continue
         seed_normal=normals[seed].copy(); seed_point=centroids[seed].copy(); queue=deque([int(seed)]); region=[]; claimed[seed]=True
+        s0,s1,s2=normal_list[seed]; p0,p1,p2=centroid_list[seed]
         while queue:
             cur=queue.popleft(); region.append(cur)
             for nb in adjacency[cur]:
                 if claimed[nb]: continue
-                if abs(float(np.dot(normals[nb],seed_normal)))<cos_thr: continue
-                if abs(float(np.dot(centroids[nb]-seed_point,seed_normal)))>tol: continue
+                n0,n1,n2=normal_list[nb]
+                if abs(n0*s0+n1*s1+n2*s2)<cos_thr: continue
+                c0,c1,c2=centroid_list[nb]
+                if abs((c0-p0)*s0+(c1-p1)*s1+(c2-p2)*s2)>tol: continue
                 claimed[nb]=True; queue.append(nb)
         if len(region)<min_faces: continue
         region=np.asarray(region,dtype=np.int64); area=float(np.sum(areas[region]))
@@ -2806,6 +3099,11 @@ def parse_image_xy_point_observations(images_txt: Path) -> dict[str, list[tuple[
         except ValueError:
             continue
         name = " ".join(parts[9:])
+        parsed = parse_xy_id_triples(pts)
+        if parsed is not None:
+            xs, ys, ids = parsed
+            result[name] = list(zip(xs.tolist(), ys.tolist(), ids.tolist()))
+            continue
         obs = []
         vals = pts.split()
         for j in range(0, len(vals) - 2, 3):
@@ -5330,8 +5628,161 @@ Dot {{
 
     path.write_text(nk, encoding="utf-8")
 
+SPEED_PROFILES = ("fast", "legacy")
+
+# Legacy behaviour: exhaustive matching for every shot up to this many frames.
+LEGACY_EXHAUSTIVE_MAX_FRAMES = 250
+
+
+def default_speed_profile() -> str:
+    """AUTOLENS_SPEED_PROFILE=legacy restores the pre-speed-up pipeline for A/B tests."""
+    value = str(os.environ.get("AUTOLENS_SPEED_PROFILE", "fast")).strip().lower()
+    return value if value in SPEED_PROFILES else "fast"
+
+
+def names_in_frame_order(names: list[str]) -> bool:
+    """
+    COLMAP's sequential matcher orders frames by file name. That is the shot
+    order only when name order agrees with the frame numbers, which fails for
+    unpadded numbering (shot.9.exr sorts after shot.10.exr).
+    """
+    ordered = sorted(str(n).replace("\\", "/") for n in names)
+    frames = [parse_frame_number(n, i) for i, n in enumerate(ordered)]
+    return all(b > a for a, b in zip(frames, frames[1:]))
+
+
+def choose_matching_plan(
+    num_images: int,
+    profile: str = "fast",
+    exhaustive_max_frames: int = 60,
+    sequential_overlap: int = 20,
+    names_are_ordered: bool = True,
+) -> dict:
+    """
+    Decide how COLMAP matches the sequence.
+
+    Exhaustive matching compares every frame with every other frame:
+    n*(n-1)/2 pairs, about 31,000 for 250 frames. Movie plates are ordered,
+    so the fast profile matches each frame against its next
+    `sequential_overlap` frames plus frames 2^k further on (quadratic
+    overlap), which keeps long baselines for slow moves at a fraction of the
+    pairs. Short shots stay exhaustive because that is already cheap.
+
+    `retry_exhaustive` asks main() to add the remaining exhaustive pairs and
+    map again if sequential matching registers too few frames, so a shot the
+    old pipeline could solve is never lost to the faster matcher.
+    """
+    n = max(0, int(num_images))
+    if profile == "legacy" or not names_are_ordered:
+        # Unordered names would make sequential matching pair the wrong
+        # frames, so fall back to the old rule for those shots.
+        limit = LEGACY_EXHAUSTIVE_MAX_FRAMES
+        sequential_options = []
+    else:
+        limit = max(3, int(exhaustive_max_frames))
+        sequential_options = [
+            ("SequentialMatching.overlap", max(1, int(sequential_overlap))),
+            ("SequentialMatching.quadratic_overlap", 1),
+            # Loop detection needs a vocabulary tree, which newer COLMAP
+            # downloads on first use. Keep it off; quadratic overlap covers
+            # most returning moves on plate-length shots.
+            ("SequentialMatching.loop_detection", 0),
+        ]
+
+    if n <= limit:
+        return {
+            "name": "exhaustive",
+            "command": "exhaustive_matcher",
+            "options": [],
+            "pair_count": n * (n - 1) // 2,
+            "retry_exhaustive": False,
+        }
+
+    return {
+        "name": "sequential",
+        "command": "sequential_matcher",
+        "options": sequential_options,
+        "pair_count": estimate_sequential_pairs(n, sequential_overlap if sequential_options else 10),
+        # Only retry where the old pipeline would have matched exhaustively.
+        "retry_exhaustive": profile != "legacy" and n <= LEGACY_EXHAUSTIVE_MAX_FRAMES,
+    }
+
+
+def estimate_sequential_pairs(num_images: int, overlap: int, quadratic: bool = True) -> int:
+    """
+    Pair count of COLMAP's sequential matcher, for the log: each frame is
+    matched with the next `overlap` frames and, with quadratic overlap, with
+    the frames 2^k ahead for k < overlap.
+    """
+    n = max(0, int(num_images))
+    overlap = max(1, int(overlap))
+    offsets = set(range(1, overlap + 1))
+    if quadratic:
+        k = 0
+        while k < overlap and 2 ** k < n:
+            offsets.add(2 ** k)
+            k += 1
+    return sum(max(0, n - d) for d in offsets)
+
+
+def mapper_speed_options(profile: str = "fast") -> list:
+    """
+    Incremental-mapper settings for the fast profile.
+
+    COLMAP re-runs global bundle adjustment every time the model grows by
+    ba_global_*_ratio (default 1.1, i.e. every 10%). On a 250-frame plate that
+    is roughly 50 global BAs, which dominate mapping time. 1.2 halves them; the
+    final global BA still runs on the complete model, so the delivered camera
+    and lens are refined just as fully. COLMAP's own docs suggest exactly this
+    for faster reconstruction. COLMAP 3.12+ renamed "images" to "frames".
+    """
+    if profile == "legacy":
+        return []
+    return [
+        (("Mapper.ba_global_frames_ratio", "Mapper.ba_global_images_ratio"), 1.2),
+        ("Mapper.ba_global_points_ratio", 1.2),
+    ]
+
+
+def should_retry_with_exhaustive(
+    plan: dict,
+    mapper_ok: bool,
+    registered: int,
+    total_images: int,
+    min_ratio: float = 0.9,
+) -> bool:
+    if not plan.get("retry_exhaustive"):
+        return False
+    if not mapper_ok:
+        return True
+    return int(registered) < float(min_ratio) * int(total_images)
+
+
+def best_registered_count(colmap: str, sparse_root: Path) -> int:
+    """Registered-frame count of the largest model under a mapper output folder."""
+    best = 0
+    try:
+        for model_dir, txt_dir in iter_models(sparse_root):
+            if not model_dir_is_valid(model_dir):
+                continue
+            images_txt = txt_dir / "images.txt"
+            if not images_txt.exists():
+                if not run_try([
+                    colmap, "model_converter",
+                    "--input_path", str(model_dir),
+                    "--output_path", str(txt_dir),
+                    "--output_type", "TXT",
+                ], label="model_converter"):
+                    continue
+            best = max(best, count_registered_images(images_txt))
+    except Exception as exc:
+        print(f"[AUTOLENS] Could not inspect sparse models: {exc}")
+    return best
+
+
 def main():
     total_started = time.perf_counter()
+    del STAGE_TIMINGS[:]
 
     parser = argparse.ArgumentParser(
         description="Solve lens/camera and create optimized projection-ready proxy geometry."
@@ -5499,7 +5950,38 @@ def main():
     parser.add_argument("--meshfit-padding", type=float, default=0.04)
     parser.add_argument("--skip-dense", action="store_true")
 
+    # Speed settings. "legacy" reproduces the pre-speed-up pipeline exactly so
+    # the two can be A/B tested; AUTOLENS_SPEED_PROFILE sets the default.
+    parser.add_argument(
+        "--speed-profile",
+        choices=list(SPEED_PROFILES),
+        default=default_speed_profile(),
+        help="fast (default) or legacy. Env: AUTOLENS_SPEED_PROFILE.",
+    )
+    parser.add_argument(
+        "--exhaustive-max-frames",
+        type=int,
+        default=60,
+        help="fast profile: match exhaustively up to this many frames, sequentially above.",
+    )
+    parser.add_argument(
+        "--sequential-overlap",
+        type=int,
+        default=20,
+        help="fast profile: neighbouring frames each frame is matched against.",
+    )
+    parser.add_argument(
+        "--sequential-retry-ratio",
+        type=float,
+        default=0.9,
+        help=(
+            "fast profile: if sequential matching registers fewer than this "
+            "fraction of frames, add exhaustive matches and map again."
+        ),
+    )
+
     args = parser.parse_args()
+    print(f"[AUTOLENS SPEED] Profile: {args.speed_profile}")
 
     # Catch packaging/runtime symbol errors before starting expensive COLMAP work.
     engine_runtime_preflight()
@@ -5664,33 +6146,41 @@ def main():
 
         run(feat_cmd, label="feature_extractor")
 
-        if len(images) <= 250:
-            matcher_name = "exhaustive"
-            show_progress(
-                3,
-                "Matching frames",
-                f"Exhaustively matching {len(images)} frames; database matching resumes when possible."
-            )
-            match_cmd = [
-                colmap, "exhaustive_matcher",
+        plan = choose_matching_plan(
+            len(images),
+            profile=args.speed_profile,
+            exhaustive_max_frames=args.exhaustive_max_frames,
+            sequential_overlap=args.sequential_overlap,
+            names_are_ordered=names_in_frame_order([p.name for p in images]),
+        )
+        matcher_name = plan["name"]
+
+        def matcher_command(command, options=()):
+            cmd = [
+                colmap, command,
                 "--database_path", str(database),
                 "--FeatureMatching.type", "SIFT_BRUTEFORCE",
                 "--FeatureMatching.use_gpu", "1" if args.use_gpu else "0",
             ]
+            if options:
+                cmd += select_supported_options(
+                    options,
+                    colmap_supported_options(colmap, command),
+                )
+            return cmd
+
+        if matcher_name == "exhaustive":
+            detail = (
+                f"Exhaustively matching {len(images)} frames "
+                f"({plan['pair_count']:,} pairs); database matching resumes when possible."
+            )
         else:
-            matcher_name = "sequential"
-            show_progress(
-                3,
-                "Matching frames",
-                f"Sequentially matching {len(images)} frames."
+            detail = (
+                f"Sequentially matching {len(images)} frames "
+                f"(~{plan['pair_count']:,} pairs)."
             )
-            match_cmd = [
-                colmap, "sequential_matcher",
-                "--database_path", str(database),
-                "--FeatureMatching.type", "SIFT_BRUTEFORCE",
-                "--FeatureMatching.use_gpu", "1" if args.use_gpu else "0",
-            ]
-        run(match_cmd, label=f"{matcher_name}_matcher")
+        show_progress(3, "Matching frames", detail)
+        run(matcher_command(plan["command"], plan["options"]), label=f"{matcher_name}_matcher")
 
         show_progress(
             4,
@@ -5704,9 +6194,38 @@ def main():
             "--image_path", str(images_dir),
             "--output_path", str(sparse),
         ]
+        speed_options = mapper_speed_options(args.speed_profile)
+        if speed_options:
+            mapper_cmd += select_supported_options(
+                speed_options,
+                colmap_supported_options(colmap, "mapper"),
+            )
 
         solve_method = "incremental"
         mapper_ok = run_try(mapper_cmd, label="incremental_mapper")
+
+        if plan["retry_exhaustive"]:
+            registered = best_registered_count(colmap, sparse) if mapper_ok else 0
+            if should_retry_with_exhaustive(
+                plan,
+                mapper_ok,
+                registered,
+                len(images),
+                args.sequential_retry_ratio,
+            ):
+                print("\n" + "!" * 72)
+                print("AUTOLENS MATCHING FALLBACK")
+                print(
+                    f"Sequential matching registered {registered}/{len(images)} frames. "
+                    "Adding the remaining exhaustive pairs and mapping again."
+                )
+                print("!" * 72 + "\n")
+                run(matcher_command("exhaustive_matcher"), label="exhaustive_matcher_fallback")
+
+                shutil.rmtree(sparse)
+                sparse.mkdir(parents=True, exist_ok=True)
+                matcher_name = "sequential+exhaustive"
+                mapper_ok = run_try(mapper_cmd, label="incremental_mapper_retry")
 
         if not mapper_ok:
             print("\n" + "!" * 72)
@@ -5787,6 +6306,7 @@ def main():
             f"Best reconstruction registered only {reg_count} images."
         )
 
+    parse_started = time.perf_counter()
     cam = parse_camera(best_txt / "cameras.txt")
     solve_cam = cam
     source_format = source_format_from_args(args, solve_cam)
@@ -5834,6 +6354,7 @@ def main():
         cam["width"],
         cam["height"],
     )
+    record_timing("parse_sparse_model", time.perf_counter() - parse_started)
 
     point_errors = np.array([p["error"] for p in points], dtype=np.float64)
     mean_point_error = float(np.mean(point_errors))
@@ -5947,10 +6468,7 @@ def main():
         }
 
     print("[AUTOLENS LENS] 3/3 Native lens + camera outputs complete")
-    print(
-        f"[AUTOLENS TIMING] lens_camera_outputs: "
-        f"{format_duration(time.perf_counter() - stage6_started)}"
-    )
+    record_timing("lens_camera_outputs", time.perf_counter() - stage6_started)
 
     dense_info = None
     proxy_obj = None
@@ -5972,6 +6490,7 @@ def main():
             observations=observations,
             settings=dense_settings,
             force_dense=args.force_dense,
+            speed_profile=args.speed_profile,
         )
 
         selection_report_path = output / "autolens_dense_selection.json"
@@ -5986,6 +6505,7 @@ def main():
             "Creating proxy OBJ and connected mesh-fit planar proxies."
         )
 
+        geometry_started = time.perf_counter()
         proxy_vertices, proxy_faces = read_ply_mesh(
             dense_info["proxy_ply"]
         )
@@ -6013,10 +6533,12 @@ def main():
         if meshfit_surfaces:
             meshfit_planes_obj = output / "autolens_meshfit_planes.obj"
             write_meshfit_planes_obj(meshfit_planes_obj, meshfit_surfaces)
+        record_timing("projection_geometry", time.perf_counter() - geometry_started)
 
         if args.surface_guides:
             guide_path = Path(args.surface_guides).resolve()
             if guide_path.exists():
+                guided_started = time.perf_counter()
                 print(
                     "\n[AUTOLENS] Fitting user-drawn 2D surface guides "
                     "into the solved 3D scene..."
@@ -6071,6 +6593,7 @@ def main():
                         "error": str(exc),
                         "successful_surface_count": 0,
                     }
+                record_timing("guided_surfaces", time.perf_counter() - guided_started)
 
         print("\nGeometry summary:")
         print(f"  Proxy mesh:       {proxy_obj}")
@@ -6084,6 +6607,11 @@ def main():
         "solver": "COLMAP shared-intrinsics + optimized dense MVS + connected mesh-fit planes",
         "matching_method": matcher_name,
         "sfm_method": solve_method,
+        "speed_profile": args.speed_profile,
+        "timings": {
+            "stages": list(STAGE_TIMINGS),
+            "total_seconds_before_nuke_script": round(time.perf_counter() - total_started, 3),
+        },
         "camera": solve_cam,
         "nuke_camera": nuke_cam,
         "source_format": source_format,
@@ -6198,7 +6726,9 @@ def main():
     print(f"Guided surfaces:  {guided_surfaces_obj}")
     print(f"Nuke script:      {nk_path}")
     print(f"JSON:             {result_json}")
+    print(f"Speed profile:    {args.speed_profile}")
     print(f"TOTAL TIME:       {format_duration(total_elapsed)}")
+    print_timing_summary(total_elapsed)
     print("============================================================")
 
 
