@@ -16,6 +16,7 @@ except ImportError:
     Signal = QtCore.Signal
 
 from . import __version__
+from .startup import defer_initial_preview, timed
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
 from .surface_guides import (
@@ -1103,16 +1104,21 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
         self.setMinimumSize(900, 620)
 
-        self._build_ui()
-        self._install_shortcuts()
-        self._construct_panel()
-        self._load_node_settings(self.read_node)
+        with timed("dialog: build UI"):
+            self._build_ui()
+            self._install_shortcuts()
+        with timed("dialog: build Solve panel"):
+            self._construct_panel()
+        with timed("dialog: load node settings"):
+            self._load_node_settings(self.read_node)
         self._wire_node_sync()
 
-        self._load_preview()
-        self._reload_surfaces()
-        self._reload_masks()
-        self._refresh_timeline()
+        # The plate preview can mean a Nuke render (EXR, TIFF), so by default
+        # it loads on the first event-loop turn after the window is shown.
+        # AUTOLENS_DEFER_PREVIEW=0 loads it here, before the window appears.
+        self._initial_load_done = False
+        if not defer_initial_preview():
+            self._initial_load()
 
         # AutoLens is designed as a full workspace, not a utility popup.
         # Give it a sensible fallback size here; show_autolens_dialog() opens it
@@ -1126,6 +1132,18 @@ class AutoLensDialog(QtWidgets.QDialog):
             )
         else:
             self.resize(1440, 900)
+
+    def _initial_load(self):
+        """Plate preview, surfaces, masks and timeline. Runs once."""
+        if self._initial_load_done:
+            return
+        self._initial_load_done = True
+
+        with timed("dialog: preview, surfaces, masks, timeline"):
+            self._load_preview()
+            self._reload_surfaces()
+            self._reload_masks()
+            self._refresh_timeline()
 
     # ------------------------------------------------------------------
     # UI
@@ -1346,7 +1364,13 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
 
     def _install_shortcuts(self):
-        self.fit_shortcut = QtGui.QShortcut(
+        # QShortcut lives in QtGui on Qt6 (PySide6) but QtWidgets on Qt5
+        # (PySide2, Nuke 14).
+        shortcut_class = (
+            getattr(QtGui, "QShortcut", None)
+            or QtWidgets.QShortcut
+        )
+        self.fit_shortcut = shortcut_class(
             QtGui.QKeySequence("F"),
             self,
         )
@@ -1574,13 +1598,14 @@ class AutoLensDialog(QtWidgets.QDialog):
 
 
     def _construct_panel(self):
-        # Make the upstream Read selected while the existing solve panel builds.
+        # Clear the selection while the solve panel builds so it can't pick up
+        # an unrelated selected Read. The upstream Read is applied once, by
+        # _load_node_settings(); selecting it here made the panel scan the
+        # plate folder and solve versions twice.
         old_selection = list(nuke.selectedNodes())
         try:
             for node in old_selection:
                 node.setSelected(False)
-            if self.read_node is not None:
-                self.read_node.setSelected(True)
 
             self.panel = AutoLensPanel(self)
         finally:
@@ -1656,6 +1681,22 @@ class AutoLensDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+        # Each setText() on these fields fires a version rescan, a result
+        # rescan and a plate-folder count through the panel's signals, on top
+        # of the explicit calls below. Hold the signals while the fields are
+        # filled; the explicit sync and restore_result_state() below bring the
+        # panel and controller to the same final state.
+        blocked = [
+            widget
+            for widget in (
+                getattr(self.panel, "source_edit", None),
+                getattr(self.panel, "output_edit", None),
+                getattr(self.panel, "version_combo", None),
+            )
+            if widget is not None
+        ]
+        was_blocked = [widget.blockSignals(True) for widget in blocked]
+
         if read is not None:
             self.panel.use_selected_read(read)
 
@@ -1726,11 +1767,14 @@ class AutoLensDialog(QtWidgets.QDialog):
                         index
                     )
 
+        for widget, previous in zip(blocked, was_blocked):
+            widget.blockSignals(previous)
+
         # One final sync ensures the Setup / Run panel and controller agree on
         # the user's selected version before any result/cache state is restored.
+        # restore_result_state() runs once, at the end, after the remaining
+        # settings are loaded; it rescans the output folder each time.
         self.panel._sync_controller_output()
-        self.panel.restore_result_state()
-        self.panel._update_run_button_text()
 
         if node.knob("autolens_quality"):
             idx = self.panel.quality_combo.findText(
@@ -2427,7 +2471,8 @@ def show_autolens_dialog(controller_node):
         return existing
 
     try:
-        dialog = AutoLensDialog(controller_node)
+        with timed("dialog: construct"):
+            dialog = AutoLensDialog(controller_node)
     except Exception as exc:
         # Include the exception type; much more useful than Nuke's generic popup.
         import traceback
@@ -2441,9 +2486,10 @@ def show_autolens_dialog(controller_node):
         return None
 
     _DIALOGS[key] = dialog
-    dialog.showMaximized()
-    dialog.raise_()
-    dialog.activateWindow()
+    with timed("dialog: show window"):
+        dialog.showMaximized()
+        dialog.raise_()
+        dialog.activateWindow()
 
     # Apply the preferred sidebar width after the maximize/layout pass. Qt can
     # otherwise preserve the constructor-time splitter ratio.
@@ -2457,5 +2503,23 @@ def show_autolens_dialog(controller_node):
         )
     except Exception:
         pass
+
+    # Plate preview, surfaces, masks and timeline, once the window is up.
+    # A no-op when AUTOLENS_DEFER_PREVIEW=0 already loaded them.
+    def _deferred_initial_load(d=dialog):
+        try:
+            QtWidgets.QApplication.processEvents()
+            d._initial_load()
+        except Exception as exc:
+            if "already deleted" in str(exc):
+                # The window was closed before the timer fired.
+                return
+            import traceback
+            nuke.tprint(
+                "[AutoLens] Workspace preview failed to load:\n"
+                + traceback.format_exc()
+            )
+
+    QtCore.QTimer.singleShot(0, _deferred_initial_load)
 
     return dialog

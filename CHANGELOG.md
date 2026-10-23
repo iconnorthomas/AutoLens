@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Faster Nuke launch and script open.** `menu.py` no longer imports the AutoLens controller
+  module at launch; it loads when you add a node or use one. Opening a script now skips AutoLens
+  nodes that this plugin version has already upgraded (new hidden `autolens_plugin_version` knob)
+  and no longer scans every node's output folder for solve versions, results and guided
+  surfaces. That refresh still runs when the node's properties or the workspace open. Set
+  `AUTOLENS_FULL_REFRESH_ON_LOAD=1` to get the old behaviour back.
+- **The workspace window opens before the plate preview loads.** The preview (which can be a
+  Nuke render for EXR plates), surfaces, masks and timeline load right after the window
+  appears. Opening also does less repeated work: the plate folder is counted once instead of
+  up to three times, the result folder is scanned fewer times, and the
+  installer config is read once. Set `AUTOLENS_DEFER_PREVIEW=0` to load the preview before the
+  window shows, as before.
+- **Fix: the workspace could not open on Nuke 14.** Its F (fit) shortcut used
+  `QtGui.QShortcut`, which only exists in PySide6; PySide2 has it in `QtWidgets`.
+- **Startup profiling.** Launch Nuke with `AUTOLENS_PROFILE=1` to print
+  `[AutoLens profile] …` timings for launch, script open and workspace open. Run
+  `import autolens.startup; autolens.startup.report()` in the Script Editor to list them again.
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep
