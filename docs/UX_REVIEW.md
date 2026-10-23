@@ -230,6 +230,33 @@ Create from solve moved to the AutoLens Advanced tab on new nodes.
 | Controls on the node's main tab | 8 | 2 (Open AutoLens..., Create All) |
 | Geometry for a camera-only track | Re-run the whole track with different settings | One click: Build geometry |
 
+### Mask overlay that plays with the shot
+
+Before, an overlay existed only for frames that had settled, so playback
+blinked the red mask on and off. Now (`autolens/mask_cache.py`):
+
+- **Filled in idle time.** While the Track step is showing, a 15 ms timer samples a few rows of the next missing frame within a 10 ms budget per tick. It works outward from the playhead (+1, −1, +2, −2…) and pauses during playback.
+- **No blinking.** A frame that isn't ready yet shows the nearest ready overlay. The timeline's new red *Mask* lane shows which frames are ready.
+- **Nuke's frame never moves.** Each pixel is one `sample(channel, x, y, 1, 1, frame)` call with the frame passed explicitly, on a 160 × 90 grid (14,400 samples per frame). Rows go into a premultiplied byte buffer, not `setPixelColor`. Builds that can't take a frame argument fall back to filling only the settled frame.
+- **Why sampling rather than a render.** At an estimated 10–20 µs per sample, a frame costs roughly 0.15–0.3 s of idle time, spread over ticks, so a 100-frame shot fills in under half a minute without blocking. A Write render needs a temporary node and a disk round trip for each frame. The measured cost per frame is written to **View › Log** after 10 frames and when the cache is full.
+- **Invalidation.** A signature of the mask's upstream graph (adapted from Match's NukeSource) covers node classes, wiring and non-default knob values including animation keys, plus Invert and the mask size. It is re-checked when the Track step opens and whenever the window becomes active again, and the cache clears only if the signature changed. Renaming or moving nodes doesn't clear it; re-keying a Roto does. **Track › Refresh mask preview** forces a refill.
+- The cache is kept in memory only, about 56 KB per frame.
+
+### Track time
+
+The engine already saves per-stage timings in `autolens_result.json`. The
+workspace now also times the Nuke-side prep before the engine starts (plate
+proxy, mask and guide export) and the engine's wall time. It saves both in
+`autolens_ui_timing.json` beside the result, under `track` and `geometry`, so
+the total matches what the artist waited.
+
+- **Chip:** *SOLVED · 0.30 px · 9m 06s*; its tooltip has the full breakdown.
+- **Status bar** when a run finishes: *Track complete in 9m 06s (Nuke prep 12s).*
+- **Output › Timing:** stages longest first, plus the last geometry build time.
+- **View › Log:** the same breakdown, written when the run finishes.
+
+Solves made before this build, such as the user's v1 (574 s) and v2 (546 s), show the engine's own total.
+
 ### Testing
 
 The step logic, chip, hints, geometry status, tick spacing and theme are pure

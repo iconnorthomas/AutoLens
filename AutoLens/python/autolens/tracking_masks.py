@@ -610,7 +610,9 @@ def resolve_sampler(node, channel, frame=None, probe=(0.5, 0.5)):
     """A fast (x, y) -> value sampler using the first sample() form that works.
 
     Tries the frame-explicit forms first, once, at `probe`, so the per-pixel
-    loop doesn't pay for failed calls on every pixel.
+    loop doesn't pay for failed calls on every pixel. The returned function's
+    `frame_explicit` attribute says whether it samples `frame` itself (True)
+    or whatever frame Nuke is on (False).
     """
     sample = getattr(node, "sample", None)
     if sample is None:
@@ -620,220 +622,128 @@ def resolve_sampler(node, channel, frame=None, probe=(0.5, 0.5)):
     forms = []
     if frame is not None:
         f = int(frame)
-        forms.append(lambda x, y: sample(channel, float(x), float(y), 1, 1, f))
-        forms.append(lambda x, y: sample(channel, float(x), float(y), frame=f))
-    forms.append(lambda x, y: sample(channel, float(x), float(y)))
-    forms.append(lambda x, y: sample(channel, float(x), float(y), 1, 1))
+        forms.append((lambda x, y: sample(channel, float(x), float(y), 1, 1, f), True))
+        forms.append((lambda x, y: sample(channel, float(x), float(y), frame=f), True))
+    forms.append((lambda x, y: sample(channel, float(x), float(y)), False))
+    forms.append((lambda x, y: sample(channel, float(x), float(y), 1, 1), False))
     last_error = None
-    for form in forms:
+    for form, explicit in forms:
         try:
             float(form(*probe))
         except Exception as exc:
             last_error = exc
             continue
-        return lambda x, y, form=form: float(form(x, y))
+        sampler = lambda x, y, form=form: float(form(x, y))  # noqa: E731
+        sampler.frame_explicit = explicit
+        return sampler
     raise RuntimeError(
         "Could not sample connected mask alpha."
         + (f" {last_error}" if last_error is not None else "")
     )
 
 
+def _mask_raster_size(mask_source, controller):
+    try:
+        width, height = int(mask_source.width()), int(mask_source.height())
+    except Exception:
+        width = height = 0
+    if width <= 0 or height <= 0:
+        try:
+            width, height = int(controller.width()), int(controller.height())
+        except Exception:
+            width, height = 1920, 1080
+    return width, height
+
+
+def mask_overlay_job(controller, frame):
+    """
+    An OverlayJob for `frame` of the connected mask, or None without a mask.
+
+    The job samples the frame explicitly when this Nuke build allows it
+    (`job.frame_explicit`). Otherwise it samples Nuke's current frame, so the
+    caller must put Nuke on `frame` while the job runs.
+    """
+    from .mask_cache import OverlayJob
+
+    mask_source = connected_mask_node(controller)
+    if mask_source is None:
+        return None
+    width, height = _mask_raster_size(mask_source, controller)
+    sampler = resolve_sampler(
+        mask_source,
+        _mask_alpha_channel(mask_source),
+        frame,
+        probe=(width * 0.5, height * 0.5),
+    )
+    job = OverlayJob(frame, sampler, width, height, inverted=mask_inverted(controller))
+    job.frame_explicit = bool(getattr(sampler, "frame_explicit", False))
+    return job
+
+
+def mask_signature(controller):
+    """Hash of the mask's upstream graph and the invert setting, or None."""
+    from .mask_cache import OVERLAY_WIDTH, graph_signature
+
+    mask_source = connected_mask_node(controller)
+    if mask_source is None:
+        return None
+    return graph_signature(
+        mask_source,
+        nuke,
+        extra=[bool(mask_inverted(controller)), _mask_raster_size(mask_source, controller), OVERLAY_WIDTH],
+    )
+
+
+def overlay_pixmap(job):
+    """A QPixmap from a finished OverlayJob."""
+    data = job.data()
+    image = QtGui.QImage(
+        data,
+        job.width,
+        job.height,
+        job.width * 4,
+        getattr(QtGui.QImage, "Format_ARGB32_Premultiplied", None)
+        or QtGui.QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    # QImage doesn't own `data`; copy before it goes away.
+    return QtGui.QPixmap.fromImage(image.copy())
+
+
 def render_mask_overlay_pixmap(
     controller,
     frame,
-    max_preview_width=240,
+    max_preview_width=None,
 ):
     """
-    Build the viewer mask overlay WITHOUT launching a Nuke render.
-
-    The connected mask node is sampled directly at a modest preview resolution.
-    This is intentionally lower resolution than the solve mask because the
-    overlay is only a UX visualization.
+    Build the viewer mask overlay for one frame now, WITHOUT a Nuke render.
 
     Red means the area AutoLens will exclude from tracking:
       normal: alpha       -> red
       invert: 1 - alpha   -> red
-
-    The red overlay is 20% opacity at a fully masked pixel.
+    The red overlay is 20% opacity at a fully masked pixel. The workspace
+    normally fills overlays in idle time (see autolens.mask_cache); this is
+    the one-shot version.
     """
-    mask_source = connected_mask_node(
-        controller
-    )
-
-    if mask_source is None:
+    job = mask_overlay_job(controller, frame)
+    if job is None:
         return QtGui.QPixmap()
 
+    old_frame = int(nuke.frame())
+    moved = False
     try:
-        source_width = int(
-            mask_source.width()
-        )
-        source_height = int(
-            mask_source.height()
-        )
-    except Exception:
-        source_width = 0
-        source_height = 0
-
-    if (
-        source_width <= 0
-        or source_height <= 0
-    ):
-        try:
-            source_width = int(
-                controller.width()
-            )
-            source_height = int(
-                controller.height()
-            )
-        except Exception:
-            source_width = 1920
-            source_height = 1080
-
-    preview_width = max(
-        32,
-        min(
-            int(max_preview_width),
-            int(source_width),
-        ),
-    )
-
-    preview_height = max(
-        18,
-        int(
-            round(
-                preview_width
-                * float(source_height)
-                / max(
-                    float(source_width),
-                    1.0,
-                )
-            )
-        ),
-    )
-
-    channel = _mask_alpha_channel(
-        mask_source
-    )
-    inverted = mask_inverted(
-        controller
-    )
-
-    image = QtGui.QImage(
-        preview_width,
-        preview_height,
-        QtGui.QImage.Format_ARGB32,
-    )
-    image.fill(
-        QtGui.QColor(
-            255,
-            0,
-            0,
-            0,
-        )
-    )
-
-    old_frame = int(
-        nuke.frame()
-    )
-
-    try:
-        nuke.frame(
-            int(frame)
-        )
-
-        sampler = resolve_sampler(
-            mask_source,
-            channel,
-            frame,
-            probe=(source_width * 0.5, source_height * 0.5),
-        )
-
-        # Pixel-center sampling in the source raster. Nuke image coordinates
-        # are bottom-left based; QImage rows are top-down, so flip Y.
-        for py in range(
-            preview_height
-        ):
-            source_y = (
-                (
-                    preview_height
-                    - 1
-                    - py
-                    + 0.5
-                )
-                / float(
-                    preview_height
-                )
-                * float(
-                    source_height
-                )
-            )
-
-            for px in range(
-                preview_width
-            ):
-                source_x = (
-                    (
-                        px
-                        + 0.5
-                    )
-                    / float(
-                        preview_width
-                    )
-                    * float(
-                        source_width
-                    )
-                )
-
-                alpha = sampler(
-                    source_x,
-                    source_y,
-                )
-
-                alpha = max(
-                    0.0,
-                    min(
-                        1.0,
-                        float(alpha),
-                    ),
-                )
-
-                # The overlay represents the region AutoLens will AVOID.
-                avoid = (
-                    1.0 - alpha
-                    if inverted
-                    else alpha
-                )
-
-                overlay_alpha = int(
-                    round(
-                        255.0
-                        * 0.20
-                        * avoid
-                    )
-                )
-
-                image.setPixelColor(
-                    px,
-                    py,
-                    QtGui.QColor(
-                        255,
-                        0,
-                        0,
-                        overlay_alpha,
-                    ),
-                )
-
-    finally:
-        try:
-            nuke.frame(
-                old_frame
-            )
-        except Exception:
+        if not job.frame_explicit and old_frame != int(frame):
+            nuke.frame(int(frame))
+            moved = True
+        while not job.step(1.0):
             pass
+    finally:
+        if moved:
+            try:
+                nuke.frame(old_frame)
+            except Exception:
+                pass
 
-    return QtGui.QPixmap.fromImage(
-        image
-    )
+    return overlay_pixmap(job)
 
 
 def export_input_alpha_masks(
