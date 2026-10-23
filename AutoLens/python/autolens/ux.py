@@ -412,16 +412,24 @@ def failure_message(info):
 WORKSPACE_STEPS = (("track", "Track"), ("draw", "Draw"), ("output", "Output"))
 WORKSPACE_KEYS = tuple(key for key, _label in WORKSPACE_STEPS)
 
-# Engine flags for the two kinds of run. A track that leaves geometry for
-# later skips the dense stages. "Build geometry" is a Resume run without the
-# flag: it reuses the cached camera solve and only computes what's missing.
+# Engine flags for camera first, geometry later (the engine's final interface).
+# A camera-only track solves the camera and lens, writes the .nk and fits any
+# surface guides to sparse points. "Build geometry" then runs only the dense
+# stages from that cached solve: never extraction, matching or mapping. The
+# engine refuses --geometry-only together with --skip-dense or --force.
 CAMERA_ONLY_ARGS = ("--skip-dense",)
-BUILD_GEOMETRY_ARGS = ()
+BUILD_GEOMETRY_ARGS = ("--geometry-only",)
+GEOMETRY_STATUS_FILE = "autolens_geometry_status.json"
 
 
 def solve_args(build_geometry=True):
     """Extra engine flags for a track, depending on whether geometry is built now."""
-    return list(BUILD_GEOMETRY_ARGS if build_geometry else CAMERA_ONLY_ARGS)
+    return [] if build_geometry else list(CAMERA_ONLY_ARGS)
+
+
+def geometry_only_args():
+    """Engine flags for Build geometry (no run-mode flags may go with them)."""
+    return list(BUILD_GEOMETRY_ARGS)
 
 
 def step_index(key):
@@ -463,7 +471,8 @@ def next_step_after_solve(surfaces):
 
 
 def workspace_hint(step, has_plate=True, installed=True, running=False, solved=False,
-                   surfaces=0, geometry_ready=False, created=False):
+                   surfaces=0, geometry_ready=False, created=False, geometry="",
+                   geometry_detail=""):
     """One line telling the artist what to do next on `step`."""
     step = WORKSPACE_KEYS[step_index(step)]
     surfaces = int(surfaces)
@@ -488,6 +497,11 @@ def workspace_hint(step, has_plate=True, installed=True, running=False, solved=F
 
     if not solved:
         return "Track the camera first: the camera and lens come from the track."
+    if geometry == "building":
+        return "Building geometry from the tracked camera. Create All when it finishes."
+    if geometry == "failed":
+        reason = f" ({geometry_detail})" if geometry_detail else ""
+        return f"The geometry build didn't finish{reason}. Build geometry again; the camera is kept."
     if not geometry_ready:
         return "Camera and lens are ready. Build geometry for the mesh and surfaces, or Create All now."
     if created:
@@ -495,10 +509,11 @@ def workspace_hint(step, has_plate=True, installed=True, running=False, solved=F
     return "Create All builds the camera, lens and geometry in the comp."
 
 
-def solve_chip(running=False, percent=0, solved=False, failed=False, error_px=None):
+def solve_chip(running=False, percent=0, solved=False, failed=False, error_px=None, building=False):
     """(text, state) for the viewer's status chip."""
     if running:
-        return f"TRACKING {max(0, min(100, int(percent)))}%", "running"
+        verb = "BUILDING GEOMETRY" if building else "TRACKING"
+        return f"{verb} {max(0, min(100, int(percent)))}%", "running"
     if solved:
         if error_px is not None:
             try:
@@ -562,6 +577,64 @@ def geometry_status(result, exists=None):
         items.append((label, bool(path) and bool(exists(path))))
     overall = "ready" if items[0][1] else "missing"
     return overall, items
+
+
+def load_geometry_status(output_folder):
+    """The engine's autolens_geometry_status.json as a dict, or {}."""
+    import json
+    from pathlib import Path
+
+    if not output_folder:
+        return {}
+    path = Path(str(output_folder)) / GEOMETRY_STATUS_FILE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def geometry_overview(result, status=None, running=False, exists=None):
+    """
+    Everything the Output step shows about geometry.
+
+    Returns (overall, items, detail). overall is one of:
+      "none"      no solve yet
+      "missing"   a camera-only solve, geometry not built
+      "building"  the engine is building it right now
+      "failed"    the last build failed or was interrupted
+      "ready"     the proxy mesh exists
+    `status` is the engine's geometry status file; `running` says whether this
+    workspace's engine process is alive. A file stuck at "building" with no
+    process means the build was killed.
+    """
+    status = status or {}
+    state = str(status.get("status") or "")
+    overall, items = geometry_status(result, exists=exists)
+
+    # A finished build lists its own outputs; prefer them when they're newer.
+    if state == "ready" and result:
+        merged = dict(result)
+        outputs = dict(result.get("geometry_outputs") or {})
+        for key, _label in GEOMETRY_ITEMS:
+            if status.get(key):
+                outputs[key] = status[key]
+        merged["geometry_outputs"] = outputs
+        overall, items = geometry_status(merged, exists=exists)
+
+    if not result:
+        return "none", items, ""
+    if state == "building":
+        if not running:
+            return "failed", items, "the last build was interrupted"
+        step, total = status.get("step"), status.get("total")
+        stage = str(status.get("stage") or "")
+        if step and total:
+            return "building", items, f"Step {int(step)} of {int(total)}: {stage}".rstrip(": ")
+        return "building", items, stage
+    if state == "failed" and overall != "ready":
+        return "failed", items, str(status.get("error") or "")
+    return overall, items, ""
 
 
 _NICE_STEPS = (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000)

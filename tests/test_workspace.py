@@ -110,14 +110,88 @@ class ResultTests(unittest.TestCase):
     def test_solve_args(self):
         self.assertEqual(ux.solve_args(True), [])
         self.assertEqual(ux.solve_args(False), ["--skip-dense"])
+        self.assertEqual(ux.geometry_only_args(), ["--geometry-only"])
+        # The engine refuses --geometry-only with --skip-dense or --force.
+        self.assertFalse(set(ux.geometry_only_args()) & {"--skip-dense", "--force"})
 
-    def test_skip_dense_is_an_engine_flag(self):
-        engine = (PACKAGE.parent.parent / "engine" / "autolens_engine.py").read_text(encoding="utf-8")
-        for flag in ux.CAMERA_ONLY_ARGS + ux.BUILD_GEOMETRY_ARGS:
+    def _engine(self):
+        return (PACKAGE.parent.parent / "engine" / "autolens_engine.py").read_text(encoding="utf-8")
+
+    def test_engine_flags_and_keys(self):
+        engine = self._engine()
+        for flag in ux.CAMERA_ONLY_ARGS:
             self.assertIn(f'"{flag}"', engine)
         for key, _label in ux.GEOMETRY_ITEMS:
             self.assertIn(f'"{key}"', engine)
         self.assertIn('"mean_sparse_reprojection_error_px"', engine)
+
+    def test_geometry_only_engine_flag(self):
+        engine = self._engine()
+        if '"--geometry-only"' not in engine:
+            self.skipTest("needs the camera-first engine from perf/solve-10x")
+        for flag in ux.BUILD_GEOMETRY_ARGS:
+            self.assertIn(f'"{flag}"', engine)
+        self.assertIn(ux.GEOMETRY_STATUS_FILE, engine)
+
+
+class GeometryOverviewTests(unittest.TestCase):
+    CAMERA_ONLY = {"geometry_status": "none", "geometry_outputs": {
+        "proxy_mesh_obj": None, "meshfit_planes_obj": None, "guided_surfaces_obj": None}}
+    BUILT = {"geometry_status": "ready", "geometry_outputs": {
+        "proxy_mesh_obj": "p.obj", "meshfit_planes_obj": "m.obj", "guided_surfaces_obj": None}}
+
+    def overview(self, result, status=None, running=False):
+        return ux.geometry_overview(result, status, running=running, exists=lambda p: True)
+
+    def test_no_solve(self):
+        self.assertEqual(self.overview({})[0], "none")
+        self.assertEqual(self.overview({}, {"status": "building"}, running=True)[0], "none")
+
+    def test_camera_only(self):
+        self.assertEqual(self.overview(self.CAMERA_ONLY)[0], "missing")
+        self.assertEqual(self.overview(self.CAMERA_ONLY, {"status": "none"})[0], "missing")
+
+    def test_building(self):
+        status = {"status": "building", "step": 8, "total": 11, "stage": "Computing dense depth maps"}
+        overall, _items, detail = self.overview(self.CAMERA_ONLY, status, running=True)
+        self.assertEqual(overall, "building")
+        self.assertEqual(detail, "Step 8 of 11: Computing dense depth maps")
+        self.assertEqual(self.overview(self.CAMERA_ONLY, {"status": "building"}, running=True)[2], "")
+
+    def test_killed_build_counts_as_failed(self):
+        overall, _items, detail = self.overview(self.CAMERA_ONLY, {"status": "building"}, running=False)
+        self.assertEqual(overall, "failed")
+        self.assertIn("interrupted", detail)
+
+    def test_failed(self):
+        overall, _items, detail = self.overview(self.CAMERA_ONLY, {"status": "failed", "error": "no cached solve"})
+        self.assertEqual((overall, detail), ("failed", "no cached solve"))
+        # An older failure doesn't hide geometry that's on disk.
+        self.assertEqual(self.overview(self.BUILT, {"status": "failed"})[0], "ready")
+
+    def test_ready_uses_status_paths(self):
+        status = {"status": "ready", "proxy_mesh_obj": "p.obj", "meshfit_planes_obj": "m.obj",
+                  "guided_surfaces_obj": "g.obj"}
+        overall, items, _detail = self.overview(self.CAMERA_ONLY, status)
+        self.assertEqual(overall, "ready")
+        self.assertEqual([ready for _l, ready in items], [True, True, True])
+
+    def test_load_geometry_status(self):
+        self.assertEqual(ux.load_geometry_status(""), {})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(ux.load_geometry_status(tmp), {})
+            (Path(tmp) / ux.GEOMETRY_STATUS_FILE).write_text('{"status": "ready"}', encoding="utf-8")
+            self.assertEqual(ux.load_geometry_status(tmp)["status"], "ready")
+            (Path(tmp) / ux.GEOMETRY_STATUS_FILE).write_text("[1, 2]", encoding="utf-8")
+            self.assertEqual(ux.load_geometry_status(tmp), {})
+
+    def test_building_chip_and_hints(self):
+        self.assertEqual(ux.solve_chip(running=True, percent=60, building=True),
+                         ("BUILDING GEOMETRY 60%", "running"))
+        self.assertIn("Building geometry", ux.workspace_hint("output", solved=True, geometry="building"))
+        hint = ux.workspace_hint("output", solved=True, geometry="failed", geometry_detail="out of memory")
+        self.assertIn("out of memory", hint)
+        self.assertIn("Build geometry again", hint)
 
 
 class TimelineTests(unittest.TestCase):

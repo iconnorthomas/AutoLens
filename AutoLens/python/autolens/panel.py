@@ -30,7 +30,7 @@ from .runner import AutoLensRunner
 from .importer import import_result
 from .ux import (
     QUALITY_PRESETS, QUALITY_ORDER, RUN_MODES, preset_name, preset_summary,
-    settings_match_preset, run_mode_args, solve_args, current_step, step_hint,
+    settings_match_preset, run_mode_args, solve_args, geometry_only_args, current_step, step_hint,
     step_indicator_html, explain_failure, failure_message, format_duration,
 )
 from .surface_guides import (
@@ -140,6 +140,8 @@ class AutoLensPanel(QtWidgets.QWidget):
         self._imported = False
         self._install_ready = False
         self._geometry_run = False
+        # True while the engine process is a Build geometry run, not a track.
+        self.geometry_build_running = False
         # Refreshes elapsed time / ETA between the engine's stage updates.
         self._progress_timer = QtCore.QTimer(self)
         self._progress_timer.setInterval(1000)
@@ -1145,8 +1147,9 @@ class AutoLensPanel(QtWidgets.QWidget):
         colmap = self.colmap_edit.text().strip()
         if colmap: args += ["--colmap", colmap]
         if self._geometry_run:
-            # Build geometry: resume the existing solve and run the dense stages.
-            args += solve_args(build_geometry=True)
+            # Build geometry: only the dense stages, from the cached solve. The
+            # engine refuses run-mode flags (--force) with --geometry-only.
+            args += geometry_only_args()
         else:
             args += run_mode_args(self.run_mode.currentIndex())
             args += solve_args(self.build_geometry_checkbox.isChecked())
@@ -1592,11 +1595,14 @@ class AutoLensPanel(QtWidgets.QWidget):
             )
             return
         self._geometry_run = True
+        # Set before starting, so the runner's started signal already sees it.
+        self.geometry_build_running = True
         try:
             self.run_autolens()
         finally:
             # run_autolens has built its arguments (or bailed out) by now.
             self._geometry_run = False
+        self.geometry_build_running = self.runner.is_running()
 
     def run_autolens(self):
         if self.runner.is_running():
@@ -1647,6 +1653,7 @@ class AutoLensPanel(QtWidgets.QWidget):
         self._update_step_indicator()
 
     def _process_finished(self, exit_code):
+        self.geometry_build_running = False
         self._progress_timer.stop()
         self.run_button.setEnabled(True)
         self.background_button.setEnabled(False)

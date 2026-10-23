@@ -218,7 +218,7 @@ Create from solve moved to the AutoLens Advanced tab on new nodes.
 | Create from solve + Create (node only) | **Create one ▾** on Output and **Output › Create one** (still on the node's Advanced tab) |
 | Install status / report | **File › Installation status…** / **Open install report** |
 | Use surface guides (checkbox) | **Draw › Use surfaces in the track** (also in Solve settings) |
-| — | New: **Build geometry** and *Build geometry during the track* (off = camera and lens only, via the engine's `--skip-dense`) |
+| — | New: *Build geometry during the track* (off = camera and lens only, `--skip-dense`) and **Build geometry** on Output (`--geometry-only`: dense stages only, from the cached solve). Output polls the engine's `autolens_geometry_status.json` for *building* (step n of 11), *ready* and *failed*. A file stuck at *building* with no live process is shown as an interrupted build. |
 
 ### Step counts, before (first pass) and after
 

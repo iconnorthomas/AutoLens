@@ -31,6 +31,7 @@ PLAYHEAD = "#f1f3f5"
 SURFACE_ON = "#69e178"   # a surface on its own guide frame
 SURFACE_OFF = "#cdcdcd"  # a surface seen from another frame
 MASK = "#e0605e"         # tracking-mask exclusion overlay
+STATUS_FAILED = "#e0605e"
 
 # Viewer chip states: (text colour, background, border).
 CHIP = {

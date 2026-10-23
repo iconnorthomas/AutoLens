@@ -16,8 +16,9 @@
   - Plate, output, version, run mode, GPU and dense settings are in **File › Solve settings…**;
     the log is in **View › Log**. Every earlier control is still reachable.
 - **Build geometry later.** *Build geometry during the track* (on by default) can be switched off
-  to track only the camera and lens. **Build geometry** on Output then runs just the geometry
-  stages, reusing the tracked camera.
+  to track only the camera and lens (`--skip-dense`). **Build geometry** on Output then runs just
+  the geometry stages from the cached solve (`--geometry-only`). Output shows the build's progress,
+  and whether it finished, failed or was interrupted, from `autolens_geometry_status.json`.
 - **Smaller node panel.** New AutoLens nodes show only Open AutoLens..., the status and Create All
   on the main tab. Quality, output and Create from solve are on the AutoLens Advanced tab.
 

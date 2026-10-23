@@ -1502,6 +1502,9 @@ class AutoLensDialog(QtWidgets.QDialog):
             cl.addLayout(row)
             self.geometry_rows.append(state)
         op.addWidget(card)
+        self.geometry_detail = _wrap(_label("", "Faint"))
+        self.geometry_detail.hide()
+        op.addWidget(self.geometry_detail)
         self.build_geometry_button = QtWidgets.QPushButton("  Build geometry")
         self.build_geometry_button.setIcon(icons.icon("cube"))
         self.build_geometry_button.setIconSize(icons.icon_size())
@@ -2091,7 +2094,11 @@ class AutoLensDialog(QtWidgets.QDialog):
         solved = bool(p.last_result_nk)
         failed = bool(p.last_failure) and not solved
         result = self._solve_result() if solved else {}
-        geometry, items = ux.geometry_status(result)
+        folder = p._resolved_output_folder()
+        building = running and bool(getattr(p, "geometry_build_running", False))
+        geometry, items, geometry_detail = ux.geometry_overview(
+            result, ux.load_geometry_status(folder) if solved else {}, running=running,
+        )
         surfaces = len(getattr(self.canvas, "surfaces", []) or [])
         has_plate = self.read_node is not None
         installed = bool(getattr(p, "_install_ready", True))
@@ -2108,7 +2115,7 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         text, chip_state = ux.solve_chip(
             running=running, percent=self._last_percent, solved=solved and not running,
-            failed=failed, error_px=ux.result_error_px(result),
+            failed=failed, error_px=ux.result_error_px(result), building=building,
         )
         self.chip.setText(text)
         self.chip.setStyleSheet(theme.chip_style(chip_state))
@@ -2117,6 +2124,7 @@ class AutoLensDialog(QtWidgets.QDialog):
             has_plate=has_plate, installed=installed, running=running, solved=solved,
             surfaces=surfaces, geometry_ready=geometry == "ready",
             created=bool(getattr(p, "_imported", False)),
+            geometry=geometry, geometry_detail=geometry_detail,
         )
         self.hint_label.setText(ux.workspace_hint(self._step, **hint_args))
         self.track_info.setText(ux.workspace_hint("track", **hint_args))
@@ -2130,9 +2138,25 @@ class AutoLensDialog(QtWidgets.QDialog):
             elif ready:
                 state_label.setText("✓ ready")
                 state_label.setStyleSheet(f"color: {theme.CACHE};")
+            elif geometry == "building":
+                state_label.setText("building…")
+                state_label.setStyleSheet(f"color: {theme.ACCENT};")
             else:
                 state_label.setText("not built")
                 state_label.setStyleSheet(f"color: {theme.TEXT_FAINT};")
+        if geometry == "building":
+            self.geometry_detail.setText(geometry_detail or "Building…")
+            self.geometry_detail.setStyleSheet(f"color: {theme.ACCENT};")
+        elif geometry == "failed":
+            self.geometry_detail.setText(
+                "Last build failed" + (f": {geometry_detail}" if geometry_detail else "."))
+            self.geometry_detail.setStyleSheet(f"color: {theme.STATUS_FAILED};")
+        elif geometry == "missing":
+            self.geometry_detail.setText("Camera-only track: geometry not built yet.")
+            self.geometry_detail.setStyleSheet("")
+        else:
+            self.geometry_detail.setText("")
+        self.geometry_detail.setVisible(bool(self.geometry_detail.text()))
         self.build_geometry_button.setEnabled(solved and not running)
         self.build_geometry_button.setText(
             "  Rebuild geometry" if geometry == "ready" else "  Build geometry")
