@@ -22,12 +22,19 @@ from .frame_cache import (
     clamp_frame,
     contiguous_runs,
     nearest_cached,
+    playback_step,
     prefetch_order,
     step_frame,
 )
-from .plate_cache import PlateCacheManager, default_cache_root
-from .plate_source import NukePlateSource
-from .preview_loader import PreviewLoader, supported_extensions
+from .frame_decode import WORKER_EXTS, transfer_for
+from .frame_server import FrameServerPool, managed_python
+from .plate_reader import ReadSnapshot, choose_pattern, upstream_note
+from .preview_loader import (
+    PreviewLoader,
+    decode_image,
+    supported_extensions,
+    worker_decoder,
+)
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
 from .surface_guides import (
@@ -50,14 +57,6 @@ from .tracking_masks import (
 
 _DIALOGS = {}
 
-# Viewer frames Nuke renders (EXR, DPX, graded plates...) are capped at this
-# long edge. Idle caching renders for up to CACHE_STEP_SECONDS every
-# CACHE_TICK_MS on the main thread (Nuke renders must run there), nearest the
-# playhead first, so the workspace never blocks or shows a progress window.
-PROXY_MAX_WIDTH = 2048
-CACHE_TICK_MS = 15
-CACHE_STEP_SECONDS = 0.06
-CACHE_REFRESH_SECONDS = 2.0
 
 LEFT_BUTTON = getattr(
     QtCore.Qt,
@@ -157,6 +156,7 @@ class SurfaceCanvas(QtWidgets.QWidget):
     surfacesChanged = Signal(list)
     selectionChanged = Signal(int)
     zoomChanged = Signal(float)
+    resized = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -302,6 +302,10 @@ class SurfaceCanvas(QtWidgets.QWidget):
         self.mask_overlay = QtGui.QPixmap()
         self.show_mask_overlay = False
         self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
 
     def fit_view(self):
         self.zoom = 1.0
@@ -1302,7 +1306,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         viewer_help = QtWidgets.QLabel(
             "Drag surface corners directly in this viewer.  "
             "Timeline: click/drag frame  •  Blue = surface guide frame  •  "
-            "Green = cached  •  Space: play/pause  •  ←/→ or ,/.: step  •  "
+            "Green = in memory  •  Space: play/pause  •  ←/→ or ,/.: step  •  "
             "F: fit  •  Mouse wheel: zoom  •  Middle-drag: pan"
         )
         viewer_help.setStyleSheet("color: #888; padding: 3px;")
@@ -1944,8 +1948,9 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         self._setup_preview_source(read, force=True)
         decode_failed = False
-        if self._preview_path_for_frame(frame):
-            # One file decode (never a render) so the plate is there at once.
+        if self._preview_mode == "qt" and self._preview_path_for_frame(frame):
+            # One quick Qt decode so a JPEG/PNG plate is there at once; EXR
+            # frames arrive from the frame server a moment later.
             decode_failed = self._preview.load_now(frame) is None
         self._show_frame(frame, settle=False)
         self._settle_frame(frame, refresh_surfaces=False)
@@ -1967,13 +1972,14 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._view_frame = None
         self._view_exact = False
         self._displayed_frame = None
-        self._preview_mode = None          # "direct", "render" or None
+        self._preview_mode = None          # "qt", "server" or None
         self._preview_info = {}
-        self._preview_force_render = False
-        self._plate_cache = None           # plate_cache.PlateCacheManager
-        self._cache_refresh_time = 0.0
-        self._cache_stepping = False
-        self._cache_failures_reported = 0
+        self._preview_signature = None
+        self._preview_decoder = None
+        self._preview_note = ""            # e.g. upstream nodes not shown
+        self._preview_problem = ""         # why no frames can be shown
+        self._read_snapshot = None         # plate_reader.ReadSnapshot
+        self._frame_server = None          # frame_server.FrameServerPool
         self._play_clock = None
         self._play_shown = 0
         self._play_held = 0
@@ -1999,10 +2005,6 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._settle_timer.timeout.connect(
             lambda: self._settle_frame(self._view_frame)
         )
-
-        self._cache_timer = QtCore.QTimer(self)
-        self._cache_timer.setInterval(CACHE_TICK_MS)
-        self._cache_timer.timeout.connect(self._cache_tick)
 
         self._sharp_timer = QtCore.QTimer(self)
         self._sharp_timer.setSingleShot(True)
@@ -2065,8 +2067,7 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         button(
             "Clear",
-            "Re-cache this shot's frames. Rarely needed: frames re-render "
-            "by themselves when the plate or the nodes above AutoLens change.",
+            "Forget the frames held in memory and read them from disk again.",
             self._clear_frame_cache,
             width=52,
         )
@@ -2080,6 +2081,13 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.canvas.zoomChanged.connect(
             lambda _zoom: self._sharp_timer.start()
         )
+        # A bigger viewer (e.g. the window maximising after it opens) gets
+        # sharper frames once the resize settles, not mid-playback.
+        self._resize_timer = QtCore.QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(300)
+        self._resize_timer.timeout.connect(self._refresh_decode_width)
+        self.canvas.resized.connect(self._resize_timer.start)
         self.finished.connect(self._shutdown_preview)
 
     def _install_playback_shortcuts(self):
@@ -2129,6 +2137,20 @@ class AutoLensDialog(QtWidgets.QDialog):
         super().keyPressEvent(event)
 
     # Source -----------------------------------------------------------
+    def _refresh_decode_width(self):
+        if not self._preview_mode or self._playing():
+            return
+        if self._viewer_decode_width() > self._preview._max_w:
+            self._preview.set_source(
+                self._preview.source,
+                self._preview_path_for_frame,
+                self._viewer_decode_width(),
+                self._preview_info.get("pa", 1.0),
+                decoder=self._preview_decoder,
+            )
+            if self._view_frame is not None:
+                self._request_around(self._view_frame, 0)
+
     def _viewer_decode_width(self):
         try:
             ratio = float(self.canvas.devicePixelRatioF())
@@ -2136,181 +2158,181 @@ class AutoLensDialog(QtWidgets.QDialog):
             ratio = 1.0
         return bucket_width(max(320, self.canvas.width()) * ratio)
 
-    def _plate_node(self, read):
-        """What the viewer shows: AutoLens's input 0 (the Read if unconnected)."""
+    def _snapshot_read(self, read):
+        """Copy the Read knobs the viewer needs (main thread, once per settle)."""
+        def value(name, default=""):
+            k = read.knob(name)
+            if k is None:
+                return default
+            try:
+                return k.value()
+            except Exception:
+                return default
+
+        candidates = [value("file")]
         try:
-            node = self.controller_node.input(0)
+            candidates.append(nuke.filename(read))
         except Exception:
-            node = None
-        return node or read
-
-    @staticmethod
-    def _node_id(node):
+            pass
         try:
-            return node.fullName()
+            project = nuke.root()["project_directory"].value()
         except Exception:
-            return id(node)
-
-    def _setup_preview_source(self, read, force=False):
-        """Point the viewer at this shot's plate cache. Renders nothing.
-
-        Plain JPEG/PNG/TIFF Reads are shown from their own files ("direct").
-        Anything else (EXR, DPX, movies, nodes between the Read and AutoLens)
-        is rendered by Nuke in idle time into a persistent cache keyed by the
-        upstream graph, so frames rendered once are reused next time.
-        """
-        if self._cache_stepping:
-            return          # a render is pumping events; try again next settle
-        plate = self._plate_node(read)
+            project = ""
         frame_range = source_frame_range(read)
-        if frame_range:
-            first, last = frame_range
-        else:
-            first = last = (
-                self._view_frame if self._view_frame is not None
-                else int(nuke.frame())
-            )
-        frames = list(range(int(first), int(last) + 1))
-        width = max(1, int(read.width()))
-        height = max(1, int(read.height()))
+        if not frame_range:
+            frame = self._view_frame if self._view_frame is not None else int(nuke.frame())
+            frame_range = (frame, frame)
         try:
             pa = float(read.format().pixelAspect())
         except Exception:
             pa = 1.0
-        pa = pa if pa > 0 else 1.0
+        return ReadSnapshot(
+            choose_pattern(candidates, project) or "",
+            frame_range[0],
+            frame_range[1],
+            frame_offset=value("frame"),
+            frame_mode=value("frame_mode"),
+            before=value("before", "hold"),
+            after=value("after", "hold"),
+            colorspace=value("colorspace", "default"),
+            raw=value("raw", False),
+            width=read.width(),
+            height=read.height(),
+            pixel_aspect=pa,
+        )
 
-        mgr = self._plate_cache
-        if (
-            mgr is not None
-            and not force
-            and self._node_id(mgr.source.plate_node) == self._node_id(plate)
-            and mgr.frames == frames
-        ):
-            self._refresh_plate_cache()
-        else:
-            self._cache_timer.stop()
+    def _upstream_chain(self, read):
+        """[(class, disabled)] for the nodes between AutoLens and its Read."""
+        def name(node):
             try:
-                source = NukePlateSource(
-                    plate,
-                    frames,
-                    width,
-                    height,
-                    max_size=PROXY_MAX_WIDTH,
-                    readable_exts=(
-                        () if self._preview_force_render else self._qt_formats
-                    ),
-                    nuke=nuke,
-                )
-                mgr = PlateCacheManager(source, cache_root=default_cache_root())
-            except Exception as exc:
-                self._plate_cache = None
-                self._preview_mode = None
-                self.workspace_status.setText(f"Plate cache unavailable: {exc}")
-                return
-            self._plate_cache = mgr
-            self._cache_refresh_time = time.monotonic()
-            self._cache_failures_reported = 0
+                return node.fullName()
+            except Exception:
+                return id(node)
 
-        self._preview_info = {"width": width, "height": height, "pa": pa}
-        self._preview_mode = "direct" if mgr.direct else "render"
-        self._preview.set_source(
-            (mgr.directory, self._preview_mode, width, height),
-            self._preview_path_for_frame,
-            self._viewer_decode_width(),
-            pa,
-        )
-        self._update_cache_bar()
-        if not mgr.done:
-            self._cache_timer.start()
+        chain = []
+        node = self.controller_node.input(0) if self.controller_node.inputs() else None
+        target = name(read)
+        while node is not None and name(node) != target and len(chain) < 500:
+            try:
+                cls = node.Class()
+            except Exception:
+                cls = "?"
+            disabled = False
+            try:
+                k = node.knob("disable")
+                disabled = bool(k.value()) if k is not None else False
+            except Exception:
+                pass
+            chain.append((cls, disabled))
+            node = node.input(0) if node.inputs() else None
+        return chain
 
-    def _refresh_plate_cache(self, force=False):
-        """Re-check the upstream graph and files (throttled); stale frames re-render."""
-        mgr = self._plate_cache
-        if mgr is None or self._cache_stepping:
-            return
-        now = time.monotonic()
-        if not force and now - self._cache_refresh_time < CACHE_REFRESH_SECONDS:
-            return
-        self._cache_refresh_time = now
-        try:
-            stale = mgr.refresh()
-        except Exception as exc:
-            self.workspace_status.setText(f"Plate cache check failed: {exc}")
-            return
-        if stale:
-            self._preview.forget(stale)
-            if self._preview.full is not None and self._preview.full[0] in stale:
-                self._preview.full = None
-        if not mgr.done:
-            self._cache_timer.start()
+    def _ensure_frame_server(self, python):
+        pool = self._frame_server
+        if pool is not None and pool.python == python:
+            return pool
+        if pool is not None:
+            pool.close()
+        self._frame_server = FrameServerPool(python, size=self._preview.workers)
+        return self._frame_server
 
-    def _cache_busy(self):
-        """Hold idle caching while it would get in the way."""
-        if self._cache_stepping or not self.isVisible() or self.isMinimized():
-            return True
-        if self.timeline.scrubbing:
-            return True
-        runner = getattr(getattr(self, "panel", None), "runner", None)
-        try:
-            if runner is not None and runner.is_running():
-                return True     # a solve is starting or running
-        except Exception:
-            pass
-        # Nuke's own progress bars and message boxes are modal.
-        modal = QtWidgets.QApplication.activeModalWidget()
-        return modal is not None and modal is not self
+    def _setup_preview_source(self, read, force=False):
+        """Point the viewer at the Read's own files. Renders nothing.
 
-    def _cache_tick(self):
-        """Idle time: render a few plate frames nearest the playhead.
-
-        Runs on the main thread because nuke.execute must. Each tick renders
-        at least one frame and stops when the time budget is spent, so the
-        viewer keeps responding; the timeline's cache line grows as it goes.
+        Like Mocha, frames are read straight from the files on disk: JPEG,
+        PNG and TIFF by Qt on background threads, EXR and DPX by frame-server
+        processes in AutoLens's managed Python, which send back viewer-sized
+        8-bit sRGB. Nothing is re-encoded or written.
         """
-        mgr = self._plate_cache
-        if mgr is None or mgr.done:
-            self._cache_timer.stop()
-            self._update_cache_bar()
-            self._report_cache_failures()
+        snap = self._snapshot_read(read)
+        note = upstream_note(self._upstream_chain(read))
+        note = f" • {note}" if note else ""
+        signature = snap.key()
+        max_w = self._viewer_decode_width()
+        if not force and signature == self._preview_signature and self._preview_mode:
+            self._preview_note = note + self._preview_info.get("colour_note", "")
+            self._preview.set_source(
+                self._preview.source,
+                self._preview_path_for_frame,
+                max_w,
+                snap.pixel_aspect,
+                decoder=self._preview_decoder,
+            )
             return
-        if self._cache_busy():
-            return
-        self._cache_stepping = True
-        try:
-            got = mgr.step(CACHE_STEP_SECONDS)
-        except Exception as exc:
-            self._cache_timer.stop()
-            self.workspace_status.setText(f"Plate caching stopped: {exc}")
-            return
-        finally:
-            self._cache_stepping = False
-        if got:
-            self._preview.forget(got)
-            if not self._playing() and self._view_frame is not None:
-                self._request_around(self._view_frame, 0)
-            self._update_cache_bar()
 
-    def _report_cache_failures(self):
-        mgr = self._plate_cache
-        if mgr is None or len(mgr.failed) <= self._cache_failures_reported:
-            return
-        self._cache_failures_reported = len(mgr.failed)
-        frame, error = sorted(mgr.failed.items())[0]
-        self.workspace_status.setText(
-            f"{len(mgr.failed)} plate frame(s) failed to cache, e.g. frame {frame}: {error}"
+        self._read_snapshot = snap
+        self._preview_signature = signature
+        info = {
+            "width": snap.width,
+            "height": snap.height,
+            "pa": snap.pixel_aspect,
+            "colour_note": "",
+            "source": "",
+        }
+        ext = snap.extension
+        mode, decoder, problem = None, None, ""
+        if not snap.pattern:
+            problem = (
+                "The viewer can't resolve this Read's file path (an expression, "
+                "or a relative path without a project directory)."
+            )
+        elif ext in self._qt_formats:
+            mode, decoder = "qt", decode_image
+            info["source"] = "read directly"
+        elif ext in WORKER_EXTS:
+            configured = ""
+            try:
+                configured = self.controller_node["autolens_python"].value()
+            except Exception:
+                pass
+            python = managed_python(configured)
+            if python is None:
+                problem = (
+                    f"AutoLens's Python runtime isn't installed, so .{ext} plates "
+                    "can't be shown in the viewer (JPEG/PNG/TIFF can). "
+                    "Set it up from the Solve tab."
+                )
+            else:
+                transfer, exact = transfer_for(snap.colorspace, snap.raw, ext)
+                mode = "server"
+                decoder = worker_decoder(self._ensure_frame_server(python), transfer)
+                info["source"] = f"read directly, {transfer} → sRGB"
+                if not exact:
+                    info["colour_note"] = (
+                        f" • colour approximated for '{snap.colorspace}'"
+                    )
+        else:
+            problem = f"The viewer can't read .{ext} files directly."
+
+        self._preview_mode = mode
+        self._preview_decoder = decoder
+        self._preview_problem = problem
+        self._preview_note = note + info["colour_note"]
+        self._preview_info = info
+        self._preview.set_source(
+            ("plate", signature, mode),
+            self._preview_path_for_frame,
+            max_w,
+            snap.pixel_aspect,
+            decoder=decoder,
         )
+        if problem:
+            self.workspace_status.setText(problem)
+        self._update_cache_bar()
 
     def _preview_path_for_frame(self, frame):
-        mgr = self._plate_cache
-        return mgr.path(frame) if mgr is not None else None
+        snap = self._read_snapshot
+        if snap is None or not self._preview_mode:
+            return None
+        return snap.path(frame)
 
     # Frames -----------------------------------------------------------
     def _show_frame(self, frame, settle=False, direction=0, playing=False):
         """Put `frame` on screen as fast as possible.
 
-        Decoded: shown now. Otherwise the nearest decoded frame stands in
-        (held while playing) and the exact frame is swapped in when it has
-        been decoded, or rendered by idle caching. Never renders here.
+        In memory: shown now. Otherwise the nearest frame in memory stands in
+        (held while playing) and the exact frame is swapped in as soon as it
+        has been read from disk. Never renders anything.
         """
         frame = clamp_frame(
             frame,
@@ -2321,11 +2343,6 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.timeline.set_current_frame(frame)
         self.canvas.set_current_frame(frame)
         self._preview.protect = {frame}
-        if self._plate_cache is not None:
-            # Idle caching works outward from here.
-            self._plate_cache.request(frame)
-            if not self._plate_cache.done and not self._cache_timer.isActive():
-                self._cache_timer.start()
 
         pixmap = self._preview.pixmap(frame)
         if pixmap is not None:
@@ -2396,11 +2413,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._preview.request(order)
 
     def _settle_frame(self, frame, refresh_surfaces=True):
-        """Bring Nuke and the rest of the workspace onto the shown frame.
-
-        Never renders: a frame that isn't cached yet is rendered next by idle
-        caching and swapped in when it's ready.
-        """
+        """Bring Nuke and the rest of the workspace onto the shown frame."""
         self._settle_timer.stop()
         if frame is None or self._playing():
             return
@@ -2415,14 +2428,12 @@ class AutoLensDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        if self.read_node is None:
-            # A Read may have been connected since the dialog opened.
-            read = source_read_for_node(self.controller_node)
-            if read is not None:
-                self.read_node = read
-                self._setup_preview_source(read, force=True)
-        else:
-            self._setup_preview_source(self.read_node)
+        # Pick up a newly connected Read or edited Read knobs.
+        read = source_read_for_node(self.controller_node) or self.read_node
+        if read is not None:
+            changed = self.read_node is None or self.read_node.fullName() != read.fullName()
+            self.read_node = read
+            self._setup_preview_source(read, force=changed)
 
         if refresh_surfaces:
             self._reload_surfaces()
@@ -2438,34 +2449,36 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._update_frame_status()
 
     def _update_frame_status(self):
-        info = self._preview_info
+        if self._preview_problem:
+            self.workspace_status.setText(self._preview_problem)
+            return
         if not self._preview_mode:
             return
+        info = self._preview_info
         frame = self._view_frame
-        mgr = self._plate_cache
         if not self._view_exact:
-            if mgr is not None and frame in mgr.failed:
-                text = f"Frame {frame} failed to cache: {mgr.failed[frame]}"
-            elif mgr is not None and mgr.path(frame) is None:
-                text = (
-                    f"Frame {frame} is still caching; the nearest cached "
-                    "frame is shown. Surface data is still editable."
-                )
+            path = self._preview_path_for_frame(frame)
+            error = self._preview.errors.get(frame)
+            if path is None:
+                text = f"Frame {frame} is outside the Read's frames (black)."
+            elif error:
+                text = f"Frame {frame} couldn't be read: {error}"
+            elif frame in self._preview.failed:
+                text = f"Frame {frame} couldn't be read: {path}"
             else:
-                text = f"Loading frame {frame}…"
-            self.workspace_status.setText(text)
+                text = f"Reading frame {frame}…"
+            self.workspace_status.setText(text + self._preview_note)
             return
-        source = "plate files" if self._preview_mode == "direct" else "cached render"
         self.workspace_status.setText(
             f"Frame {frame} • {info['width']} × {info['height']} "
-            f"• PAR {info['pa']:g} • {source}"
+            f"• PAR {info['pa']:g} • {info['source']}{self._preview_note}"
         )
 
     def _request_sharp(self):
         # Viewer-sized frames look soft when zoomed in; load the settled frame
-        # at full size for direct sequences.
+        # at full size.
         if (
-            self._preview_mode == "direct"
+            self._preview_mode
             and not self._playing()
             and self.canvas.zoom > 1.25
             and self._view_frame is not None
@@ -2494,45 +2507,14 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._update_cache_bar()
 
     def _preview_frame_failed(self, frame):
-        mgr = self._plate_cache
-        if mgr is None or frame != self._view_frame:
-            return
-        path = mgr.path(frame)
-        if not path or not os.path.isfile(path):
-            return
-        if self._preview_mode == "direct" and not self._preview_force_render:
-            # The file is there but this Qt can't decode it (float TIFF, odd
-            # PNG...): let Nuke render this plate instead.
-            self._preview_force_render = True
-            QtCore.QTimer.singleShot(0, self._reload_preview_source)
-        elif self._preview_mode == "render" and not self._cache_stepping:
-            # A damaged cache file: render it again.
-            mgr.invalidate([frame])
-            self._preview.forget([frame])
-            mgr.request(frame)
-            self._cache_timer.start()
-
-    def _reload_preview_source(self):
-        if self.read_node is None:
-            return
-        self._setup_preview_source(self.read_node, force=True)
-        self._settle_frame(self._view_frame)
+        if frame == self._view_frame and not self._playing():
+            self._update_frame_status()
 
     def _update_cache_bar(self):
         frames = self._preview.frames()
-        mgr = self._plate_cache
-        disk = mgr.cached_frames() if mgr is not None else []
-        self.timeline.set_cached_ranges(
-            contiguous_runs(frames),
-            contiguous_runs(disk),
-        )
-        if mgr is not None and not mgr.done:
-            # The quiet progress hint; caching never opens a window.
-            text = f"Caching plate {len(disk)} / {len(mgr.frames)}"
-        else:
-            used = self._preview.cache.total_bytes / (1024.0 * 1024.0)
-            text = f"{len(frames)} in memory • {used:.0f} MB"
-        self.cache_label.setText(text)
+        self.timeline.set_cached_ranges(contiguous_runs(frames), ())
+        used = self._preview.cache.total_bytes / (1024.0 * 1024.0)
+        self.cache_label.setText(f"{len(frames)} in memory • {used:.0f} MB")
 
     # Transport --------------------------------------------------------
     def _playing(self):
@@ -2571,12 +2553,6 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._play_timer.start(max(1, int(500.0 / fps)))
         self._sync_play_buttons()
         self._show_frame(frame, direction=direction, playing=True)
-        mgr = self._plate_cache
-        if mgr is not None and not mgr.done:
-            self.workspace_status.setText(
-                f"Playing: {len(mgr.cached_frames())} of {len(mgr.frames)} frames "
-                "cached so far; the rest fill in while the plate caches."
-            )
 
     def _stop_playback(self, settle=True):
         if not self._playing():
@@ -2590,31 +2566,39 @@ class AutoLensDialog(QtWidgets.QDialog):
         if not self.isVisible() or self._play_clock is None:
             self._stop_playback(settle=False)
             return
-        frame, finished = self._play_clock.target()
-        if frame != self._view_frame:
-            if self._preview.pixmap(frame) is None:
-                self._play_held += 1
-            self._show_frame(
-                frame,
-                direction=self._play_clock.direction,
-                playing=True,
-            )
+        clock = self._play_clock
+        target, finished = clock.target()
+        frame, rebase = playback_step(
+            self._view_frame,
+            target,
+            lambda f: self._preview.pixmap(f) is not None,
+            clock.direction,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+            loop=clock.loop,
+        )
+        if rebase:
+            # Decoding is behind: play every frame at decode speed, don't skip.
+            clock.rebase(frame if frame is not None else self._view_frame)
+            self._play_held += 1
+        if frame is not None:
+            self._show_frame(frame, direction=clock.direction, playing=True)
+        elif rebase:
+            # Keep prefetch pointed at what playback needs next.
+            self._request_around(self._view_frame, clock.direction)
 
         now = time.monotonic()
         if now - self._play_stats_time >= 1.0:
             shown = self._play_shown / (now - self._play_stats_time)
             self.workspace_status.setText(
                 f"Playing {self._play_clock.fps:g} fps • showing {shown:.1f} fps"
-                + (
-                    f" • {self._play_held} frames not ready"
-                    if self._play_held else ""
-                )
+                + (" • waiting for frames to load" if self._play_held else "")
             )
             self._play_shown = 0
             self._play_held = 0
             self._play_stats_time = now
 
-        if finished:
+        if finished and self._view_frame == target:
             self._stop_playback()
 
     def _sync_play_buttons(self):
@@ -2642,23 +2626,12 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._show_frame(frame, settle=True)
 
     def _clear_frame_cache(self):
-        if self._cache_stepping:
-            QtCore.QTimer.singleShot(50, self._clear_frame_cache)
-            return
         self._stop_playback(settle=False)
         self._preview.cancel_all()
         self._preview.cache.clear()
         self._preview.failed.clear()
+        self._preview.errors.clear()
         self._preview.full = None
-        mgr = self._plate_cache
-        if mgr is not None:
-            # Rendered frames go stale and re-render in idle time, nearest
-            # first. Nothing is deleted; direct plate files are untouched.
-            mgr.invalidate()
-            if self._view_frame is not None:
-                mgr.request(self._view_frame)
-            if not mgr.done:
-                self._cache_timer.start()
         self._update_cache_bar()
         self._settle_frame(self._view_frame)
 
@@ -2667,8 +2640,10 @@ class AutoLensDialog(QtWidgets.QDialog):
             self._play_timer.stop()
             self._settle_timer.stop()
             self._sharp_timer.stop()
-            self._cache_timer.stop()
             self._preview.shutdown()
+            if self._frame_server is not None:
+                self._frame_server.close()
+                self._frame_server = None
         except Exception:
             pass
 

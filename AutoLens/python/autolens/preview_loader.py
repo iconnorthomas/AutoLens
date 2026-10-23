@@ -1,12 +1,14 @@
 """Background decoding of viewer frames into a memory-bounded cache.
 
-Qt only, no Nuke: files are decoded with QImageReader on worker threads
-(concurrent.futures), scaled to the viewer while decoding, and turned into
-QPixmaps on the main thread by a polling QTimer. No Qt signal ever crosses a
-thread, so the dialog can be closed at any time without a dangling emitter.
+Qt only, no Nuke: frames are decoded on worker threads (concurrent.futures),
+scaled to the viewer while decoding, and turned into QPixmaps on the main
+thread by a polling QTimer. No Qt signal ever crosses a thread, so the dialog
+can be closed at any time without a dangling emitter.
 
-Anything that needs Nuke (resolving file names, rendering EXR proxies) stays
-in dialog.py on the main thread; this module only reads files that exist.
+JPEG/PNG/TIFF are decoded with QImageReader (``decode_image``). EXR/DPX are
+decoded by the frame-server processes (``worker_decoder`` over
+autolens/frame_server.py), whose 8-bit RGB is wrapped in a QImage here.
+Files are only ever read, never written.
 """
 from __future__ import annotations
 
@@ -33,6 +35,19 @@ def supported_extensions():
         except Exception:
             out.add(str(fmt).lower())
     return out
+
+
+def worker_decoder(pool, transfer):
+    """A decoder (same signature as decode_image) that asks the frame server.
+
+    Raises with the server's message on failure, so the viewer can show why.
+    """
+    def decode(path, max_w=0, pixel_aspect=1.0):
+        width, height, rgb, src = pool.decode(path, max_w, pixel_aspect, transfer)
+        image = QtGui.QImage(rgb, width, height, width * 3, QtGui.QImage.Format_RGB888)
+        # copy(): the QImage must own its pixels once `rgb` goes away.
+        return image.copy(), src
+    return decode
 
 
 def decode_image(path, max_w=0, pixel_aspect=1.0):
@@ -73,12 +88,15 @@ class PreviewLoader:
         self._wanted = []         # frames in priority order
         self._generation = 0
         self._path_for_frame = None
+        self._decoder = decode_image
         self._max_w = 0
         self._pixel_aspect = 1.0
         self.source = None
         self.failed = set()
+        self.errors = {}          # frame -> why its decode failed
         self.full = None          # (frame, QPixmap) at full resolution
         self.protect = set()
+        self.closed = False
         self.on_frames_ready = None
         self.on_frame_failed = None
         self.on_full_ready = None
@@ -88,22 +106,30 @@ class PreviewLoader:
         self._timer.timeout.connect(self._collect)
 
     # ------------------------------------------------------------------
-    def set_source(self, source, path_for_frame, max_w, pixel_aspect=1.0):
-        """Point at a new sequence; clears the cache when anything changed."""
+    def set_source(self, source, path_for_frame, max_w, pixel_aspect=1.0, decoder=None):
+        """Point at a new sequence; clears the cache when anything changed.
+
+        ``decoder(path, max_w, pixel_aspect) -> (QImage or None, src size)``
+        runs on worker threads; decode_image (Qt) when None.
+        """
+        decoder = decoder or decode_image
         if (
             source == self.source
             and int(max_w) <= self._max_w
             and path_for_frame is not None
         ):
             self._path_for_frame = path_for_frame
+            self._decoder = decoder
             return False
         self._generation += 1
         self.cancel_all()
         self.cache.clear()
         self.failed.clear()
+        self.errors.clear()
         self.full = None
         self.source = source
         self._path_for_frame = path_for_frame
+        self._decoder = decoder
         self._max_w = int(max_w)
         self._pixel_aspect = float(pixel_aspect or 1.0)
         return True
@@ -123,6 +149,7 @@ class PreviewLoader:
         for frame in frames:
             self.cache.discard(int(frame))
             self.failed.discard(int(frame))
+            self.errors.pop(int(frame), None)
 
     def is_pending(self, frame):
         return (VIEW, int(frame)) in self._pending
@@ -160,11 +187,16 @@ class PreviewLoader:
         """Decode one frame on the calling (main) thread; returns the pixmap."""
         frame = int(frame)
         path = self._path(frame)
-        image, _src = decode_image(path, self._max_w, self._pixel_aspect)
+        try:
+            image, _src = self._decoder(path, self._max_w, self._pixel_aspect)
+        except Exception as exc:
+            image = None
+            self.errors[frame] = str(exc)
         if image is None:
             self.failed.add(frame)
             return None
         self.failed.discard(frame)
+        self.errors.pop(frame, None)
         return self._store(frame, image)
 
     def cancel_all(self):
@@ -174,6 +206,7 @@ class PreviewLoader:
         self._wanted = []
 
     def shutdown(self):
+        self.closed = True
         self._timer.stop()
         self.cancel_all()
         self._generation += 1
@@ -206,13 +239,13 @@ class PreviewLoader:
 
     def _submit(self, kind, frame, max_w):
         key = (kind, frame)
-        if key in self._pending:
+        if key in self._pending or self.closed:
             return
         path = self._path(frame)
         if not path:
             return
         self._pending[key] = self._executor.submit(
-            decode_image, path, max_w, self._pixel_aspect
+            self._decoder, path, max_w, self._pixel_aspect
         )
         if not self._timer.isActive():
             self._timer.start()
@@ -236,8 +269,9 @@ class PreviewLoader:
             kind, frame = key
             try:
                 image, _src = future.result()
-            except Exception:
+            except Exception as exc:
                 image = None
+                self.errors[frame] = str(exc)
             if kind == FULL:
                 if image is not None:
                     self.full = (frame, QtGui.QPixmap.fromImage(image))

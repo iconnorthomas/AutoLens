@@ -168,5 +168,35 @@ class PlaybackClockTests(unittest.TestCase):
         self.assertEqual(clock.target(), (1, True))
 
 
+class PlaybackStepTests(unittest.TestCase):
+    def step(self, current, target, ready, direction=1, loop=True):
+        return fc.playback_step(current, target, lambda f: f in ready, direction, 1, 10, loop)
+
+    def test_target_ready_is_shown(self):
+        self.assertEqual(self.step(3, 5, {5}), (5, False))
+        self.assertEqual(self.step(3, 3, {3}), (None, False))
+
+    def test_waits_or_steps_in_order_when_behind(self):
+        # Target not decoded yet: show the next frame and slow down to it.
+        self.assertEqual(self.step(3, 6, {4, 5}), (4, True))
+        # Nothing ready: hold and wait.
+        self.assertEqual(self.step(3, 6, set()), (None, True))
+        self.assertEqual(self.step(3, 1, {2}, direction=-1), (2, True))
+        # Wraps when looping; stops at the end when not.
+        self.assertEqual(self.step(10, 2, {1}), (1, True))
+        self.assertEqual(self.step(10, 10, set(), loop=False), (None, False))
+
+    def test_rebase(self):
+        now = [0.0]
+        clock = fc.PlaybackClock(10, 1, 100, clock=lambda: now[0])
+        clock.start(1)
+        now[0] = 1.0
+        self.assertEqual(clock.target(), (11, False))
+        clock.rebase(4)                 # we were only able to show frame 4
+        self.assertEqual(clock.target(), (4, False))
+        now[0] = 1.1
+        self.assertEqual(clock.target(), (5, False))
+
+
 if __name__ == "__main__":
     unittest.main()

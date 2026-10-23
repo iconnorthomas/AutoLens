@@ -7,23 +7,21 @@
   `AUTOLENS_PREVIEW_CACHE_MB` to change it), and neighbouring frames are prefetched. Dragging
   the timeline shows the nearest cached frame at once; Nuke's frame, the surfaces and the mask
   overlay follow when the drag settles. New transport bar: first/previous/play backwards/play/
-  next/last, Loop and an fps box (defaults to the script's fps). Playback stays in real time and
-  skips frames that aren't ready. Keys: Space play/pause, ←/→ or ,/. step (Shift = 10 frames),
-  Home/End. A green bar under the timeline shows cached frames.
-- **The plate loads like Match: no progress window, nothing blocks.** Opening the workspace
-  renders nothing. Plain JPEG/PNG/TIFF Reads are shown straight from their files. Anything else
-  (EXR, DPX, movies, nodes between the Read and AutoLens) is rendered by Nuke in idle time, a few
-  frames every 15 ms within a 60 ms budget, nearest the playhead first; the timeline's cache line
-  grows and a quiet "Caching plate n / total" hint shows progress. A frame that isn't cached yet
-  shows the nearest one until it's ready. Idle caching pauses while a solve runs or Nuke shows a
-  modal window, replacing the per-frame temporary PNG render.
-- **The plate cache persists** in `%LOCALAPPDATA%\AutoLens\cache` (`~/.cache/autolens` on
-  Linux, `~/Library/Caches/AutoLens` on macOS; set `AUTOLENS_CACHE_DIR` to move it), is never
-  deleted automatically, and is keyed by the upstream graph: a frame re-renders only when a
-  node's settings, the Root colour settings or that frame's source file change, so reopening a
-  shot renders nothing. **Clear** re-caches the shot by hand.
-- Zoom and pan are kept while stepping or playing; zooming in on a JPEG/PNG plate loads the
-  settled frame at full resolution.
+  next/last, Loop and an fps box (defaults to the script's fps). Playback runs in real time and
+  waits for frames when decoding falls behind. Keys: Space play/pause, ←/→ or ,/. step
+  (Shift = 10 frames), Home/End. A green bar under the timeline shows the frames in memory.
+- **Plates are read straight from disk, like Mocha: open, press Play, and it plays.** Nothing is
+  rendered or re-encoded and no image files are written. JPEG/PNG/TIFF frames are decoded by Qt
+  on background threads; EXR and DPX frames by a pool of frame-server processes in AutoLens's
+  managed Python (numpy + OpenEXR), which read only the R/G/B channels, scale to the viewer and
+  send 8-bit sRGB back over a pipe. Colour follows the Read's colorspace knob (linear, sRGB,
+  Rec.709, gamma, Cineon) through Nuke's default sRGB view; other OCIO spaces are approximated
+  and say so. Decoded frames stay in a memory-bounded cache; when decoding falls behind, playback
+  waits for the next frame rather than skipping. If nodes sit between the Read and AutoLens, a
+  note says the viewer shows the Read's source. Without the managed Python, EXR/DPX plates show
+  a clear message instead of an image.
+- Zoom and pan are kept while stepping or playing; zooming in loads the settled frame at full
+  resolution.
 - Fix: the workspace's keyboard shortcuts used `QtGui.QShortcut`, which only exists in Qt 6;
   PySide2 (Nuke 14/15) has it in `QtWidgets`.
 

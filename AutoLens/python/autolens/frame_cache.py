@@ -218,11 +218,32 @@ def contiguous_runs(frames):
     return [(a, b) for a, b in runs]
 
 
+def playback_step(current, target, ready, direction, first, last, loop=True):
+    """What playback shows next: (frame or None, rebase the clock?).
+
+    The target frame (from the clock) is shown when it's in memory. When it
+    isn't, playback doesn't skip ahead to frames that may never be ready in
+    time: it shows the next frame in play order if that one is ready, or
+    waits, and in both cases the clock is re-based so playback runs at the
+    decoding speed until decoding gets ahead again (as Nuke's viewer does).
+    ``ready(frame)`` says whether a frame is in memory.
+    """
+    if target == current:
+        return None, False
+    if ready(target):
+        return target, False
+    nxt = step_frame(current, 1 if direction >= 0 else -1, first, last, loop)
+    if nxt != current and ready(nxt):
+        return nxt, True
+    return None, True
+
+
 class PlaybackClock:
     """Real-time playback: which frame should be on screen now.
 
-    Frames are dropped rather than slowing playback down: the target frame is
-    derived from wall-clock time since play started, not from a frame count.
+    The target frame is derived from wall-clock time since play started (or
+    since the last ``rebase``), not from a frame count, so a slow tick never
+    slows playback down.
     """
 
     def __init__(self, fps, first, last, loop=True, direction=1, clock=None):
@@ -245,6 +266,11 @@ class PlaybackClock:
                 self.start_frame = self.last
         self.start_time = self._clock()
         return self.start_frame
+
+    def rebase(self, frame, now=None):
+        """Continue timing from ``frame`` now (playback waited for a frame)."""
+        self.start_frame = clamp_frame(frame, self.first, self.last)
+        self.start_time = self._clock() if now is None else now
 
     def target(self, now=None):
         """(frame, finished) for time `now`; finished only when not looping."""
