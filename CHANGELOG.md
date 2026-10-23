@@ -22,6 +22,12 @@
   pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
   shows it next to the version, e.g. `AutoLens 0.10.30 (PR #8 · d9bf93a)`. Release installs show
   only the version.
+- **Fix: SyntaxError on every AutoLens knob change.** The node's knobChanged callback was stored
+  with a literal backslash-n instead of line breaks, so Nuke printed "unexpected character after
+  line continuation character" and version-menu sync never ran. Nodes saved with the broken
+  callback are repaired when the script opens. Node labels, the Surface Guides labels, a few
+  messages and the mask-change log line had the same problem.
+- **Fix: mesh-fit planes OBJ loaded as nothing.** It was written with literal backslash-n.
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep
