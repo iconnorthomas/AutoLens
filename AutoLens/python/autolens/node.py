@@ -9,7 +9,16 @@ import sys
 
 import nuke
 
+from . import __version__
 from .paths import find_result_nk, engine_path
+from .startup import (
+    VERSION_KNOB,
+    LEGACY_KNOBS,
+    controllers_needing_upgrade,
+    is_controller,
+    needs_upgrade,
+    timed,
+)
 
 
 def _selected_input():
@@ -879,20 +888,48 @@ def ensure_tracking_mask_input(node):
     return mask_input
 
 
+def _mark_upgraded(node):
+    """Record the plugin version that upgraded this node (hidden knob)."""
+    knob = node.knob(VERSION_KNOB)
+
+    if knob is None:
+        knob = nuke.String_Knob(
+            VERSION_KNOB,
+            "AutoLens plugin version",
+        )
+        node.addKnob(knob)
+        try:
+            knob.setVisible(False)
+        except Exception:
+            pass
+
+    try:
+        if knob.value() != __version__:
+            knob.setValue(__version__)
+    except Exception:
+        pass
+
+
 def ensure_runtime_knobs(node):
     """Upgrade existing AutoLens controller nodes to the current lightweight UI."""
     if node is None:
+        return
+
+    # Already upgraded by this plugin version: skip the structural work
+    # (Group edits, legacy guide migration) and only keep the solve-version
+    # menu in step with the output folder, as the full upgrade does.
+    if not needs_upgrade(node):
+        refresh_version_menu(
+            node,
+            prefer_latest=False,
+        )
         return
 
     ensure_tracking_mask_input(node)
 
     # Remove legacy property-panel actions that no longer belong on the
     # lightweight controller. Import Result is intentionally kept.
-    for knob_name in (
-        "autolens_guides",
-        "autolens_auto_surfaces",
-        "autolens_set_guide_frame",
-    ):
+    for knob_name in LEGACY_KNOBS:
         try:
             knob = node.knob(knob_name)
             if knob is not None:
@@ -1061,6 +1098,11 @@ def ensure_runtime_knobs(node):
             node,
             source_read=source,
         )
+    except Exception:
+        pass
+
+    try:
+        _mark_upgraded(node)
     except Exception:
         pass
 
@@ -1727,24 +1769,42 @@ def autolens_knob_changed(node, knob):
         refresh_create_items(node)
 
 
-def upgrade_existing_nodes():
+def upgrade_nodes(nodes, refresh=False):
+    """
+    Upgrade the given AutoLens controllers' knobs.
+
+    refresh=True also rescans each node's output folder (solve versions,
+    completed result, guided surfaces). Script open skips that by default:
+    the properties panel (showPanel) and the workspace run the same refresh
+    when they open.
+    """
+    for node in nodes:
+        try:
+            with timed(f"upgrade {node.fullName()}"):
+                ensure_runtime_knobs(node)
+                if refresh:
+                    refresh_version_menu(
+                        node,
+                        prefer_latest=False,
+                    )
+                    refresh_result_status(node)
+        except Exception:
+            pass
+
+
+def upgrade_existing_nodes(refresh=True):
     """Upgrade AutoLens Group controllers already present in the current script."""
     try:
         groups = nuke.allNodes("Group")
     except Exception:
         return
 
-    for node in groups:
-        try:
-            if node.knob("autolens_output") and node.knob("autolens_open"):
-                ensure_runtime_knobs(node)
-                refresh_version_menu(
-                    node,
-                    prefer_latest=False,
-                )
-                refresh_result_status(node)
-        except Exception:
-            pass
+    if refresh:
+        nodes = [node for node in groups if is_controller(node)]
+    else:
+        nodes = controllers_needing_upgrade(groups)
+
+    upgrade_nodes(nodes, refresh=refresh)
 
 
 def result_path_for_node(node):
@@ -1952,7 +2012,11 @@ def import_result_for_node(node):
 
 
 def open_dialog(node):
-    ensure_runtime_knobs(node)
-    refresh_result_status(node)
-    from .dialog import show_autolens_dialog
+    # The workspace's Solve panel refreshes the result status itself once it
+    # knows the selected solve version (restore_result_state), so only the
+    # knob upgrade runs here.
+    with timed("open_dialog: ensure_runtime_knobs"):
+        ensure_runtime_knobs(node)
+    with timed("open_dialog: import workspace"):
+        from .dialog import show_autolens_dialog
     return show_autolens_dialog(node)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 
@@ -61,3 +62,27 @@ def next_version_folder(output_folder) -> Path:
         version += 1
 
     return root / f"v{version}"
+
+
+def count_image_files(folder, extensions) -> int:
+    """
+    Count files in folder whose suffix is in extensions (lower-case, with dot).
+
+    Uses os.scandir so file-type checks come from the directory listing
+    rather than one stat per frame, which matters for long plates on network
+    storage. Returns 0 when the folder can't be read.
+    """
+    count = 0
+    try:
+        with os.scandir(str(folder)) as entries:
+            for entry in entries:
+                if os.path.splitext(entry.name)[1].lower() not in extensions:
+                    continue
+                try:
+                    if entry.is_file():
+                        count += 1
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return count

@@ -19,7 +19,7 @@ except ImportError:
     Signal = QtCore.Signal
 
 from . import PANEL_ID
-from .paths import engine_path, find_result_nk, next_version_folder
+from .paths import count_image_files, engine_path, find_result_nk, next_version_folder
 from .pixel_aspect import source_format_info, ensure_square_pixel_proxy
 from .tracking_masks import (
     mask_input_connected,
@@ -44,14 +44,29 @@ QUALITY = {
 }
 
 
+_INSTALL_CONFIG_CACHE = {}
+
+
 def _install_config():
+    # Read several times while the workspace opens; re-read only when the
+    # installer has rewritten the file.
     path = Path.home() / ".nuke" / "AutoLens" / "autolens_install.json"
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+        stat = path.stat()
+    except OSError:
+        return {}
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if _INSTALL_CONFIG_CACHE.get("key") == key:
+        return dict(_INSTALL_CONFIG_CACHE["value"])
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    return {}
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    _INSTALL_CONFIG_CACHE["key"] = key
+    _INSTALL_CONFIG_CACHE["value"] = value
+    return dict(value)
 
 def _install_report_path():
     return Path.home() / ".nuke" / "AutoLens" / "AutoLens_Install_Report.txt"
@@ -678,7 +693,7 @@ class AutoLensPanel(QtWidgets.QWidget):
         folder = Path(self.source_edit.text().strip())
         if not folder.is_dir():
             self.input_info.setText("Input folder does not exist."); return
-        count = sum(1 for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS)
+        count = count_image_files(folder, SUPPORTED_IMAGE_EXTENSIONS)
         read_text = f" • Read: {self.source_read_fullname}" if self.source_read_fullname else ""
         self.input_info.setText(f"{count} image files found{read_text}")
 
