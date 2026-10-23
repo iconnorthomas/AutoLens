@@ -1785,8 +1785,8 @@ def clear_reconstruction_cache_for_mask_change(
     cache_path: Path,
 ):
     print(
-        "\\n[AUTOLENS MASK] Tracking masks changed. "
-        "Invalidating cached tracking/dense reconstruction.\\n"
+        "\n[AUTOLENS MASK] Tracking masks changed. "
+        "Invalidating cached tracking/dense reconstruction.\n"
     )
 
     for path in (
@@ -2758,9 +2758,9 @@ def write_meshfit_planes_obj(path: Path, surfaces: list[dict]):
     with path.open('w',encoding='utf-8') as f:
         f.write('# AutoLens V0.8 connected mesh-fit planar proxies\n'); base=1
         for s in surfaces:
-            name=f"{s.get('classification','surface').upper()}_{s['surface']:02d}"; f.write(f'\\ng {name}\\n')
-            for x,y,z in np.asarray(s['corners'],dtype=np.float64): f.write(f'v {x:.10g} {y:.10g} {z:.10g}\\n')
-            f.write('f '+' '.join(str(base+i) for i in range(4))+'\\n'); base+=4
+            name=f"{s.get('classification','surface').upper()}_{s['surface']:02d}"; f.write(f'\ng {name}\n')
+            for x,y,z in np.asarray(s['corners'],dtype=np.float64): f.write(f'v {x:.10g} {y:.10g} {z:.10g}\n')
+            f.write('f '+' '.join(str(base+i) for i in range(4))+'\n'); base+=4
 
 def radial_forward(x: np.ndarray, y: np.ndarray, k1: float, k2: float):
     r2 = x * x + y * y
