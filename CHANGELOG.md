@@ -12,6 +12,8 @@
   callback are repaired when the script opens. Node labels, the Surface Guides labels, a few
   messages and the mask-change log line had the same problem.
 - **Fix: mesh-fit planes OBJ loaded as nothing.** It was written with literal backslash-n.
+- **AutoLens is now licensed under Apache 2.0.** `LICENSE` and `NOTICE` replace
+  `LICENSE_NOT_SPECIFIED.md`, and both ship in the release zip.
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep

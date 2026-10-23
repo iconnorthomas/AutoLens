@@ -1070,3 +1070,9 @@ before relying on the solve for final-pixel work.
 Developed by **DeadCow VFX**.
 
 Primary development context: NukeX, COLMAP, Python, Qt/PySide, OpenEXR, NumPy, CUDA-enabled reconstruction.
+
+---
+
+# License
+
+AutoLens is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

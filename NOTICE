@@ -1,0 +1,8 @@
+AutoLens for Nuke
+Copyright 2026 DeadCow VFX
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+AutoLens runs COLMAP (BSD 3-Clause License, https://colmap.github.io/license.html)
+as a separate program. COLMAP is not included in this repository; the AutoLens
+installer installs it from conda-forge at install time.
