@@ -34,6 +34,8 @@ def synced(version):
         "install_autolens.py": 'import os\n\nVERSION = "%s"\n' % version,
         "install_autolens.bat": ("@echo off\r\ntitle AutoLens NukeX v%s Installer\r\n"
                                  "echo AutoLens NukeX v%s Installer\r\n" % (version, version)),
+        "AutoLens/engine/autolens_engine.py": 'import os\n\nENGINE_VERSION = "%s"\n' % version,
+        "README.md": "# AutoLens\n\nCurrent build: **v%s**\n" % version,
     }
 
 

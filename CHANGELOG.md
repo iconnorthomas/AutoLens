@@ -2,177 +2,117 @@
 
 ## Unreleased
 
-- **New workspace layout: Track › Draw › Output** (Match style; see `docs/UX_REVIEW.md`).
+## 0.11.0 - 2026-10-23
+
+AutoLens 0.11.0 reworks the workspace around how artists work: **Track › Draw › Output**. Plates
+play straight from disk like Mocha, the camera arrives before the geometry, and a long list of
+Nuke 14–17 fixes makes it start, open and run faster. AutoLens is now open source under Apache 2.0.
+
+### Workspace: Track › Draw › Output
+- **New Match-style layout** (see `docs/UX_REVIEW.md`).
   - A dark, flat theme and painted icons. The top bar has File / Track / Draw / Output / View
     menus, the plate breadcrumb and step pills.
   - The side panel shows only the current step.
     - **Track:** the Track button, a quality popover, inline progress and the tracking mask.
     - **Draw:** surface tools and the surface list.
     - **Output:** Create All, Create one, geometry status and Build geometry.
-  - A chip over the viewer reads *NOT SOLVED*, *TRACKING n%*, then *SOLVED · 0.29 px*.
-  - The transport has Track and Stop in the centre, and the timeline has *Guides* and *Cache* lanes.
+  - A chip over the viewer reads *NOT SOLVED*, *TRACKING n%*, then *SOLVED · 0.29 px · 9m 06s*.
+  - The transport has Track and Stop in the centre, and the timeline has *Guides*, *Mask* and
+    *Cache* lanes.
   - The workspace moves to Draw (or Output) when a track finishes.
-  - Shortcuts: T track, P add plane, G guide frame, Del delete, Ctrl+E Create All, 1–3 steps.
+  - Shortcuts: T track, P add plane, G guide frame, Del delete, Ctrl+E Create All, 1–3 steps,
+    Space play/pause, ←/→ or ,/. step (Shift = 10 frames), Home/End.
   - Plate, output, version, run mode, GPU and dense settings are in **File › Solve settings…**;
     the log is in **View › Log**. Every earlier control is still reachable.
-- **Build geometry later.** *Build geometry during the track* (on by default) can be switched off
-  to track only the camera and lens (`--skip-dense`). **Build geometry** on Output then runs just
-  the geometry stages from the cached solve (`--geometry-only`). Output shows the build's progress,
-  and whether it finished, failed or was interrupted, from `autolens_geometry_status.json`.
-- **The tracking-mask overlay plays with the shot.**
-  - Overlays fill in idle time, outward from the playhead, and pause during playback.
-  - A frame that isn't ready shows the nearest ready one, so there's no flicker.
-  - A red *Mask* lane on the timeline shows the ready frames.
-  - The cache clears only when the mask's graph or keys change.
-- **Track time.** The SOLVED chip shows how long the track took (*SOLVED · 0.30 px · 9m 06s*),
-  including the Nuke-side prep before the engine starts. The status bar shows it when a track
-  finishes, and Output › Timing breaks it down by stage. It's saved in `autolens_ui_timing.json`
-  beside the result.
-- **Smaller node panel.** New AutoLens nodes show only Open AutoLens..., the status and Create All
-  on the main tab. Quality, output and Create from solve are on the AutoLens Advanced tab.
-
-- **Faster solves.** Shots over 60 frames are matched sequentially (each frame against its
-  next 20 frames plus frames 32, 64, 128… ahead) instead of exhaustively. That is about 6x fewer
-  image pairs at 250 frames. If sequential matching registers under 90% of the frames, AutoLens
-  adds the full exhaustive matches and solves again, so shots the old matcher could solve still
-  solve. Frames whose names don't sort in frame order (unpadded numbers) stay exhaustive.
-- The incremental mapper runs global bundle adjustment half as often during the solve
-  (`ba_global_*_ratio` 1.2). The final global adjustment is unchanged.
-- Dense reconstruction only undistorts the views it uses (typically 8–18) instead of every
-  registered frame, and falls back to all frames if COLMAP needs them.
-- Faster engine-side Python: sparse-model parsing, dense view selection (same picks),
-  proxy-mesh reading, triangle adjacency and mesh-fit plane growing.
-- **Timing summary.** The log ends with a per-stage wall-clock table, and
-  `autolens_result.json` stores it under `timings`.
-- Optional speed settings are passed to COLMAP only if `colmap <command> -h` lists them.
-  `AUTOLENS_SPEED_PROFILE=legacy` (or `--speed-profile legacy`) restores the previous pipeline
-  for A/B comparisons.
-- **Hard shots: sparse-solve recovery ladder.** When the incremental mapper fails or registers
-  under 80% of the frames, the engine now retries in stages before the global-SfM fallback:
-  relaxed initial-pair and registration limits, low-parallax limits (nodal and push-in shots),
-  merging overlapping partial models, denser covariant SIFT with guided matching, and the same
-  on contrast-normalised (CLAHE) tracking copies of the plate. A retry is used only when it
-  registers more frames than the plain solve, and relaxed retries must keep a mean reprojection
-  error under 2 px. The log says which rung won and why. Shots that already solve well run
-  exactly as before. Engine flags: `--sparse-recovery off|auto|max` (`max` adds ALIKED +
-  LightGlue features where the COLMAP build supports them) and `--min-registered-fraction`.
-  Options the installed COLMAP doesn't list in its `-h` output are skipped instead of failing.
-- Tracking copies are used for feature extraction only; the mapper, dense stages and every
-  output still read the original plate. They're written for EXR plates; for JPEG, PNG and
-  TIFF plates they need Pillow or OpenCV in the engine runtime, and the rung is skipped
-  (logged) otherwise.
-- **Registration coverage** in the log and in `autolens_result.json`
-  (`registration_coverage`: unregistered frames, their frame ranges and the longest
-  unregistered run), plus a `sparse_recovery` report of every retry rung.
-- **Simpler path from plate to solve** (see `docs/UX_REVIEW.md`).
-  - The Solve tab shows *Setup › Solve › Review › Create* with a next-step hint.
-  - The main action is now one **Solve** button under a Quality preset, and each
-    preset has a plain-language description.
-  - Run mode and GPU options are in the collapsed Advanced section.
-  - The installation box shrinks to one line when everything is installed.
-- **Readable progress.** The status shows *Step n of 11*, elapsed time and a rough
-  time remaining.
-- **Plain-language errors.** A failed solve says what went wrong and what to do next
-  (install, COLMAP, GPU memory, disk, plate, mask, unsolvable camera) instead of
-  "check the log". Cancelling no longer shows an error.
-- **Create All.** *Import Result* is now **Create All** on the node and the Solve tab.
-  It works the same way.
-- **Solve as New Version.** When the selected version already holds a solve, the
-  prompt offers *Solve as New Version* next to *Re-run*.
-- **Node layout.** New AutoLens nodes put **Open AutoLens...** and **Create All** at
-  the top, and move Run mode, Use surface guides and auto-create to the AutoLens
-  Advanced tab. Existing nodes keep their layout and get the new labels.
-- Tooltips on every node knob and Solve / Surfaces / Masks control.
-- **Fix: Create from solve failed for Proxy Mesh, Mesh-fit Planes and Guided Surfaces
-  (Combined)** with `name 'json' is not defined`. Guided surfaces now show their
-  friendly names in the list again.
-- **Fast scrubbing and real-time playback in the workspace viewer.** Frames are decoded on
-  background threads at viewer size into a memory-bounded cache (1 GB by default; set
-  `AUTOLENS_PREVIEW_CACHE_MB` to change it), and neighbouring frames are prefetched. Dragging
-  the timeline shows the nearest cached frame at once; Nuke's frame, the surfaces and the mask
-  overlay follow when the drag settles. New transport bar: first/previous/play backwards/play/
-  next/last, Loop and an fps box (defaults to the script's fps). Playback runs in real time and
-  waits for frames when decoding falls behind. Keys: Space play/pause, ←/→ or ,/. step
-  (Shift = 10 frames), Home/End. A green bar under the timeline shows the frames in memory.
 - **Plates are read straight from disk, like Mocha: open, press Play, and it plays.** Nothing is
-  rendered or re-encoded and no image files are written. JPEG/PNG/TIFF frames are decoded by Qt
-  on background threads; EXR and DPX frames by a pool of frame-server processes in AutoLens's
-  managed Python (numpy + OpenEXR), which read only the R/G/B channels, scale to the viewer and
-  send 8-bit sRGB back over a pipe. Colour follows the Read's colorspace knob (linear, sRGB,
-  Rec.709, gamma, Cineon) through Nuke's default sRGB view; other OCIO spaces are approximated
-  and say so. Decoded frames stay in a memory-bounded cache; when decoding falls behind, playback
-  waits for the next frame rather than skipping. If nodes sit between the Read and AutoLens, a
-  note says the viewer shows the Read's source. Without the managed Python, EXR/DPX plates show
-  a clear message instead of an image.
-- Zoom and pan are kept while stepping or playing; zooming in loads the settled frame at full
-  resolution.
-- Fix: the workspace's keyboard shortcuts used `QtGui.QShortcut`, which only exists in Qt 6;
-  PySide2 (Nuke 14/15) has it in `QtWidgets`.
+  rendered or re-encoded and no image files are written.
+  - JPEG/PNG/TIFF frames are decoded by Qt on background threads. EXR and DPX frames are decoded
+    by a pool of frame-server processes in AutoLens's managed Python (numpy + OpenEXR), which read
+    only R/G/B, scale to the viewer and send 8-bit sRGB back over a pipe.
+  - Colour follows the Read's colorspace knob (linear, sRGB, Rec.709, gamma, Cineon) through
+    Nuke's default sRGB view; other OCIO spaces are approximated and say so. If nodes sit between
+    the Read and AutoLens, a note says the viewer shows the Read's source.
+  - Decoded frames stay in a memory-bounded cache (1 GB by default; `AUTOLENS_PREVIEW_CACHE_MB`),
+    neighbouring frames are prefetched, and a timeline lane shows what's in memory.
+  - Scrubbing shows the nearest cached frame at once; Nuke's frame, the surfaces and the mask
+    follow when the drag settles. Playback runs in real time with Loop and an fps box.
+  - Zoom and pan are kept while stepping or playing; zooming in loads full resolution.
+- **The tracking-mask overlay follows animated masks and plays with the shot.** The mask is
+  sampled at each frame (it used to show whatever frame Nuke's viewer had last evaluated).
+  Overlays fill in idle time outward from the playhead, a frame that isn't ready shows the
+  nearest ready one, and the cache clears only when the mask's graph or keys change.
+- **Track time.** The SOLVED chip and status bar show how long the track took, including the
+  Nuke-side prep. Output › Timing breaks it down by stage; it's saved in `autolens_ui_timing.json`.
+- **Simpler controls.** One Track action with Quality presets that describe themselves, readable
+  progress (*Step n of 11*, elapsed, time left), plain-language errors with a *What to do* line,
+  no error box on cancel, and *Solve as New Version* when a version already holds a solve.
+  Tooltips on every control.
 
-- **Build label for test installs.** Installing from a git checkout records the branch, commit,
-  pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
-  shows it next to the version, e.g. `AutoLens 0.10.30 (PR #8 · d9bf93a)`. Release installs show
-  only the version.
-- **Fix: SyntaxError on every AutoLens knob change.** The node's knobChanged callback was stored
-  with a literal backslash-n instead of line breaks, so Nuke printed "unexpected character after
-  line continuation character" and version-menu sync never ran. Nodes saved with the broken
-  callback are repaired when the script opens. Node labels, the Surface Guides labels, a few
-  messages and the mask-change log line had the same problem.
-- **Fix: Nuke slowed down after adding an AutoLens node.** With the callback working again, AutoLens'
-  own knob updates fired knobChanged, which scheduled another refresh and rescanned the output
-  folder on every UI tick. The callback now ignores AutoLens' own updates, and the version menu
-  only writes knobs whose value actually changed.
-- **Fix: mesh-fit planes OBJ loaded as nothing.** It was written with literal backslash-n.
-- **AutoLens is now licensed under Apache 2.0.** `LICENSE` and `NOTICE` replace
-  `LICENSE_NOT_SPECIFIED.md`, and both ship in the release zip.
-- **Faster Nuke launch and script open.** `menu.py` no longer imports the AutoLens controller
-  module at launch; it loads when you add a node or use one. Opening a script now skips AutoLens
-  nodes that this plugin version has already upgraded (new hidden `autolens_plugin_version` knob)
-  and no longer scans every node's output folder for solve versions, results and guided
-  surfaces. That refresh still runs when the node's properties or the workspace open. Set
-  `AUTOLENS_FULL_REFRESH_ON_LOAD=1` to get the old behaviour back.
-- **The workspace window opens before the plate preview loads.** The preview (which can be a
-  Nuke render for EXR plates), surfaces, masks and timeline load right after the window
-  appears. Opening also does less repeated work: the plate folder is counted once instead of
-  up to three times, the result folder is scanned fewer times, and the
-  installer config is read once. Set `AUTOLENS_DEFER_PREVIEW=0` to load the preview before the
-  window shows, as before.
-- **Fix: the workspace could not open on Nuke 14.** Its F (fit) shortcut used
-  `QtGui.QShortcut`, which only exists in PySide6; PySide2 has it in `QtWidgets`.
-- **Startup profiling.** Launch Nuke with `AUTOLENS_PROFILE=1` to print
-  `[AutoLens profile] …` timings for launch, script open and workspace open. Run
-  `import autolens.startup; autolens.startup.report()` in the Script Editor to list them again.
-- **Version guard and release workflow** for maintainers (`scripts/release.py`, README
-  *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
-  branch that changes `__version__` must raise it above `main` and every posted release, keep
-  the installer's version in step, and move its CHANGELOG notes. Pushing a `vX.Y.Z` tag on
-  `main` checks the number again, builds the release zip from that exact commit and posts the
-  GitHub Release with its CHANGELOG notes.
-- **The release zip is no longer committed.** `releases/` is git-ignored; download AutoLens from
-  the latest GitHub Release, whose zip is always built from that release's code.
-- **Fix: AutoLens failed to load on Nuke 14 (Python 3.9).** `autolens/paths.py` used a
-  `Path | None` annotation, which Python 3.9 can't evaluate, so the AutoLens menu never
-  appeared. The new CI runs the tests on Python 3.9, 3.10 and 3.11.
-- `RELEASE_NOTES.md` is now this CHANGELOG. The one-off `GITHUB_PUBLISHING.md` checklist is gone.
-- **Code audit** (`docs/AUDIT.md`): ranked findings across the plugin, engine and installer, with
-  a roadmap of follow-up PRs. Small fixes from it:
-  - **Fix: Import Result could leave the Redistort node unwired.** The importer matched node
-    names by prefix, so `AUTOLENS_REDISTORT` could resolve to the `AUTOLENS_REDISTORT_INPUT` Dot,
-    which is then deleted.
-  - **Fix: the installer could delete the plugin it was installing** when the package was
-    unzipped into `~/.nuke`, or inside `~/.nuke/AutoLens`. It now installs in place or stops
-    with a clear message.
-  - **Fix: an interrupted upgrade no longer loses the managed runtimes.** The installer used to
-    delete `.autolens_upgrade_preserve` (the parked `.venv`, Miniforge and COLMAP environments)
-    at the start of the next run. It now moves them back, including when the copy fails part-way.
-  - **Fix: installer steps could fail on non-ASCII tool output, and timeouts never fired.** pip
-    and conda output is decoded as UTF-8 with replacement, and a watchdog enforces the step
-    timeout while a child process holds its output open.
-  - **Fix: stale frames in the square-pixel solve proxy.** The proxy cache folder is keyed only
-    by size and pixel aspect, so a different or shorter plate re-rendered into it kept the old
-    extra frames, and the solve used them.
-  - Degenerate Roto shapes (no curve, or a line) are skipped instead of aborting the guide export
-    or exporting a zero-area guide. The surface-guide JSON is written atomically.
+### Tracking and speed
+- **Camera first, geometry later.** Switch off *Build geometry during the track* to get the camera
+  and lens in about 2 minutes instead of about 9 on an 87-frame shot (`--skip-dense`). **Build
+  geometry** on Output runs only the geometry stages from the cached solve (`--geometry-only`) and
+  reports progress, success, failure or interruption through `autolens_geometry_status.json`.
+- **Faster matching.** Shots over 60 frames are matched sequentially (each frame against its next
+  20 plus frames 32, 64, 128… ahead): about 6x fewer pairs at 250 frames. If that registers under
+  90% of the frames, the exhaustive matches are added and the shot is solved again.
+- The mapper runs global bundle adjustment half as often during the solve (the final one is
+  unchanged), dense reconstruction only undistorts the views it uses, and the engine's Python
+  hot loops (model parsing, view selection, mesh reading, plane growing) are faster.
+- **Hard shots: sparse-solve recovery ladder.** When the mapper fails or registers under 80% of
+  the frames, the engine retries in stages before the global fallback: relaxed initial-pair
+  limits, low-parallax limits (nodal and push-in shots), merging partial models, denser covariant
+  SIFT with guided matching, and the same on contrast-normalised (CLAHE) tracking copies of the
+  plate. A retry is kept only if it registers more frames, with mean error under 2 px. Flags:
+  `--sparse-recovery off|auto|max` and `--min-registered-fraction`.
+- **Registration coverage and timing.** The log and `autolens_result.json` record unregistered
+  frames and ranges (`registration_coverage`), each recovery rung (`sparse_recovery`) and a
+  per-stage timing table (`timings`).
+- COLMAP options are passed only if the installed COLMAP lists them. `AUTOLENS_SPEED_PROFILE=legacy`
+  restores the previous pipeline for A/B comparisons.
+
+### Node, startup and Nuke integration
+- **Smaller node panel.** New nodes show Open AutoLens..., the status and Create All; everything
+  else is on the AutoLens Advanced tab. Existing nodes keep their knobs and get the new labels.
+- **Create All** replaces *Import Result* and works the same way.
+- **Faster Nuke launch and script open.** `menu.py` no longer imports the controller module at
+  launch, and opening a script skips nodes this version already upgraded and no longer scans every
+  node's output folder (`AUTOLENS_FULL_REFRESH_ON_LOAD=1` restores the old behaviour).
+- **The workspace window opens immediately**, and the plate, surfaces, masks and timeline load
+  right after (`AUTOLENS_DEFER_PREVIEW=0` to load them first).
+- **Startup profiling:** launch Nuke with `AUTOLENS_PROFILE=1`, then run
+  `import autolens.startup; autolens.startup.report()` in the Script Editor.
+
+### Fixes
+- **Nuke 14:** the workspace couldn't open (`QtGui.QShortcut` only exists in PySide6), and
+  AutoLens failed to load on Python 3.9 (`Path | None` annotation in `autolens/paths.py`).
+- **SyntaxError on every AutoLens knob change.** The knobChanged callback was stored with a literal
+  backslash-n, so version-menu sync never ran. Nodes saved with it are repaired when the script
+  opens. Node labels, Surface Guides labels and some messages had the same problem.
+- **Nuke slowed down after adding an AutoLens node** once that callback worked: AutoLens' own knob
+  updates retriggered it on every UI tick. It now ignores its own updates and writes only changed
+  knobs.
+- **Create from solve** failed for Proxy Mesh, Mesh-fit Planes and Guided Surfaces
+  (`name 'json' is not defined`), and the **mesh-fit planes OBJ** loaded as nothing.
+- **Import Result could leave Redistort unwired** (a node-name prefix match picked the input Dot).
+- **Installer:** it could delete the plugin it was installing when unzipped into `~/.nuke`; an
+  interrupted upgrade lost the managed runtimes; non-ASCII tool output could fail a step; step
+  timeouts never fired.
+- **Stale frames in the square-pixel solve proxy** when a different or shorter plate reused it.
+- Degenerate Roto shapes are skipped instead of aborting the guide export, and the guide JSON is
+  written atomically.
+
+### Project
+- **AutoLens is now licensed under Apache 2.0** (`LICENSE`, `NOTICE`); both ship in the release zip.
+- **Version guard and release workflow** (`scripts/release.py`, README *Version numbers and
+  releases*). Pull requests run the tests on Python 3.9–3.11 and a *Version check*; a `vX.Y.Z` tag
+  on `main` builds the release zip from that commit and posts the GitHub Release with these notes.
+  The engine's own version strings now follow `__version__` too.
+- **The release zip is no longer committed**; download it from the GitHub Release.
+- **Build label for test installs:** installing from a git checkout shows the branch or PR and
+  commit next to the version, e.g. `AutoLens 0.11.0 (PR #8 · d9bf93a)`.
+- **Code audit** (`docs/AUDIT.md`): ranked findings and a roadmap of follow-up PRs.
+- `RELEASE_NOTES.md` is now this CHANGELOG; the `GITHUB_PUBLISHING.md` checklist is gone.
 
 ## 0.10.30 - 2026-09-13
 

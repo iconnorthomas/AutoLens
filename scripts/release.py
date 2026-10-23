@@ -47,6 +47,10 @@ SYNCED = [
      "title AutoLens NukeX v%s Installer"),
     ("install_autolens.bat", re.compile(r"^echo AutoLens NukeX v(\S+) Installer", re.M),
      "echo AutoLens NukeX v%s Installer"),
+    ("AutoLens/engine/autolens_engine.py", re.compile(r'^ENGINE_VERSION\s*=\s*"([^"]+)"', re.M),
+     'ENGINE_VERSION = "%s"'),
+    ("README.md", re.compile(r"^Current build: \*\*v(\S+)\*\*", re.M),
+     "Current build: **v%s**"),
 ]
 
 # What goes in the release zip, relative to ROOT.

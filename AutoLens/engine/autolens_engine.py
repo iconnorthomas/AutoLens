@@ -81,6 +81,8 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
+# Kept equal to autolens.__version__ by scripts/release.py.
+ENGINE_VERSION = "0.11.0"
 TOTAL_STEPS = 11
 
 
@@ -4141,7 +4143,7 @@ def build_guided_surfaces(
         successful_index += 1
 
     report_payload = {
-        "version": "0.10.30",
+        "version": ENGINE_VERSION,
         "guide_file": str(guide_json),
         "matched_images": sorted(
             set(matched_images)
@@ -5124,7 +5126,7 @@ def build_propagated_depth_sequence(
     )
 
     metadata = {
-        "version": "0.10.30",
+        "version": ENGINE_VERSION,
         "type": "smart_dense_camera_reprojected_depth",
         "signature": signature,
         "coordinate_space": "undistorted AutoLens VFX raster",
@@ -5564,7 +5566,7 @@ def write_nuke_script(
     source_format = source_format or {"width": int(round(float(cam["width"]))), "height": int(round(float(cam["height"]))), "pixel_aspect": 1.0}
     root_width=int(source_format["width"]); root_height=int(source_format["height"]); root_pa=float(source_format.get("pixel_aspect",1.0))
     info = (
-        "AUTOLENS V0.10.30 SOLVE\n"
+        f"AUTOLENS V{ENGINE_VERSION} SOLVE\n"
         f"Model: {cam['model']}\n"
         f"Resolution: {root_width} x {root_height}  PAR {root_pa:g}\n"
         f"Registered camera frames: {len(poses)}\n"
@@ -5646,9 +5648,10 @@ def write_nuke_script(
         ),
     )
 
+    root_name = "AutoLens_v" + ENGINE_VERSION.replace(".", "")
     nk = f'''Root {{
  inputs 0
- name AutoLens_v01030
+ name {root_name}
  first_frame {first_frame}
  last_frame {last_frame}
  format "{root_width} {root_height} 0 0 {root_width} {root_height} {format_nuke_number(root_pa)} AutoLens_Format"
@@ -6533,7 +6536,7 @@ def main():
 
     # Save sparse cache as soon as the important solve exists.
     cache_payload = {
-        "version": "0.10.30",
+        "version": ENGINE_VERSION,
         "image_signature": current_signature,
         "sparse_root": str(sparse),
         "matching_method": matcher_name,
@@ -6585,7 +6588,7 @@ def main():
     )
 
     camera_track = {
-        "version": "0.10.30",
+        "version": ENGINE_VERSION,
         "coordinate_notes": {
             "colmap_camera_axes": "+X right, +Y down, +Z forward",
             "nuke_camera_axes": "+X right, +Y up, -Z forward",
@@ -6781,7 +6784,7 @@ def main():
 
 
     result = {
-        "version": "0.10.30",
+        "version": ENGINE_VERSION,
         "solver": "COLMAP shared-intrinsics + optimized dense MVS + connected mesh-fit planes",
         "matching_method": matcher_name,
         "sfm_method": solve_method,
@@ -6894,7 +6897,7 @@ def main():
     total_elapsed = time.perf_counter() - total_started
 
     print("\n============================================================")
-    print("AUTOLENS V0.10.30 COMPLETE")
+    print(f"AUTOLENS V{ENGINE_VERSION} COMPLETE")
     print("============================================================")
     print(f"Registered:       {reg_count}/{len(images)} images")
     print(f"Matcher:          {matcher_name}")

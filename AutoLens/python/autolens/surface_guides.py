@@ -10,6 +10,8 @@ from pathlib import Path
 import nuke
 import nuke.rotopaint as rp
 
+from . import __version__
+
 GUIDE_NODE_NAME = "AUTOLENS_SURFACE_GUIDES"
 INTERNAL_GUIDE_NODE_NAME = "AUTOLENS_SURFACE_GUIDES_INTERNAL"
 GUIDE_FRAME_KNOB = "autolens_guide_frame"
@@ -928,7 +930,7 @@ def export_surface_guides(output_folder, source_read_fullname=None, controller=N
     unique_frames = sorted(set(used_frames))
 
     payload = {
-        "version": "0.10.30",
+        "version": __version__,
         "coordinate_system": "nuke_bottom_left_pixels",
         "frame": int(primary["guide_frame"]),
         "frame_requested": int(primary["frame_requested"]),

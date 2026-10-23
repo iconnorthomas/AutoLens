@@ -1,2 +1,2 @@
-__version__ = "0.10.30"
+__version__ = "0.11.0"
 PANEL_ID = "com.autolens.nukex.panel"

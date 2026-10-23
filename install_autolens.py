@@ -13,7 +13,7 @@ import traceback
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.10.30"
+VERSION = "0.11.0"
 
 MINIFORGE_URL = (
     "https://github.com/conda-forge/miniforge/releases/latest/download/"
