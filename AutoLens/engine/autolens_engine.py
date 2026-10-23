@@ -72,6 +72,10 @@ except Exception as exc:
         f"Import error: {exc}"
     )
 
+# Sparse-solve retry ladder for hard shots lives beside this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import autolens_sparse_recovery as sparse_recovery  # noqa: E402
+
 SUPPORTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".exr"
 }
@@ -1799,6 +1803,7 @@ def clear_reconstruction_cache_for_mask_change(
         output / "autolens_camera_track.json",
         output / "autolens_lens_model.json",
         output / "AutoLens_v08.nk",
+        *sparse_recovery.work_paths(output),
         cache_path,
     ):
         try:
@@ -5498,6 +5503,7 @@ def main():
     parser.add_argument("--meshfit-max-surfaces", type=int, default=20)
     parser.add_argument("--meshfit-padding", type=float, default=0.04)
     parser.add_argument("--skip-dense", action="store_true")
+    sparse_recovery.add_arguments(parser)
 
     args = parser.parse_args()
 
@@ -5565,6 +5571,7 @@ def main():
             output / "autolens_undistort.exr",
             output / "autolens_redistort.exr",
             output / "AutoLens_v08.nk",
+            *sparse_recovery.work_paths(output),
             cache_path,
         ):
             if path.is_dir():
@@ -5590,6 +5597,7 @@ def main():
     database = output / "database.db"
     sparse = output / "sparse"
     cached_sparse = find_cached_sparse_root(output, cache)
+    recovery_report = (cache or {}).get("sparse_recovery")
 
     if cached_sparse is not None:
         sparse = cached_sparse
@@ -5707,6 +5715,21 @@ def main():
 
         solve_method = "incremental"
         mapper_ok = run_try(mapper_cmd, label="incremental_mapper")
+
+        # Hard shots: staged retry ladder before the global fallback.
+        recovered = sparse_recovery.RecoveryLadder(
+            colmap, run_try, prepare_colmap_command, output, images_dir, images,
+            feat_cmd, match_cmd, mapper_cmd,
+            mode=args.sparse_recovery, min_fraction=args.min_registered_fraction,
+        ).run(database, sparse, mapper_ok)
+        recovery_report = recovered["report"]
+        if recovered["sparse"] is not None:
+            sparse = recovered["sparse"]
+            database = recovered["database"]
+            solve_method = recovered["solve_method"]
+            mapper_ok = True
+        elif recovery_report["baseline_registered"] < 3:
+            mapper_ok = False
 
         if not mapper_ok:
             print("\n" + "!" * 72)
@@ -5842,6 +5865,12 @@ def main():
     print("\nSolved camera:")
     print(json.dumps(cam, indent=2))
     print(f"Registered images: {reg_count} / {len(images)}")
+    registration_coverage = sparse_recovery.coverage_stats(
+        [p.name for p in images],
+        sparse_recovery.read_registered_names(best_txt / "images.txt"),
+    )
+    for line in sparse_recovery.coverage_log_lines(registration_coverage):
+        print(line)
     print(f"Camera poses parsed: {len(poses)}")
     print(f"Sparse 3D points: {len(points)}")
     print(f"Mean sparse reprojection error: {mean_point_error:.4f} px")
@@ -5855,6 +5884,7 @@ def main():
         "sfm_method": solve_method,
         "best_model": str(best_model),
         "mask_signature": current_mask_signature,
+        "sparse_recovery": recovery_report,
     }
     cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
 
@@ -6102,6 +6132,8 @@ def main():
         ),
         "registered_images": reg_count,
         "total_images": len(images),
+        "registration_coverage": registration_coverage,
+        "sparse_recovery": recovery_report,
         "camera_pose_count": len(poses),
         "sparse_point_count_internal": len(points),
         "mean_sparse_reprojection_error_px": mean_point_error,

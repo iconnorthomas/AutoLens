@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Hard shots: sparse-solve recovery ladder.** When the incremental mapper fails or registers
+  under 80% of the frames, the engine now retries in stages before the global-SfM fallback:
+  relaxed initial-pair and registration limits, low-parallax limits (nodal and push-in shots),
+  merging overlapping partial models, denser covariant SIFT with guided matching, and the same
+  on contrast-normalised (CLAHE) tracking copies of the plate. A retry is used only when it
+  registers more frames than the plain solve, and relaxed retries must keep a mean reprojection
+  error under 2 px. The log says which rung won and why. Shots that already solve well run
+  exactly as before. Engine flags: `--sparse-recovery off|auto|max` (`max` adds ALIKED +
+  LightGlue features where the COLMAP build supports them) and `--min-registered-fraction`.
+  Options the installed COLMAP doesn't list in its `-h` output are skipped instead of failing.
+- Tracking copies are used for feature extraction only; the mapper, dense stages and every
+  output still read the original plate. They're written for EXR plates; for JPEG, PNG and
+  TIFF plates they need Pillow or OpenCV in the engine runtime, and the rung is skipped
+  (logged) otherwise.
+- **Registration coverage** in the log and in `autolens_result.json`
+  (`registration_coverage`: unregistered frames, their frame ranges and the longest
+  unregistered run), plus a `sparse_recovery` report of every retry rung.
+
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep
