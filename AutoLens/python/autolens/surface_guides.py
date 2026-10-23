@@ -599,7 +599,7 @@ def ensure_guide_node(source_read=None, controller=None, show=True):
                     name=INTERNAL_GUIDE_NODE_NAME
                 )
                 node["label"].setValue(
-                    "AUTOLENS SURFACE GUIDES\\n"
+                    "AUTOLENS SURFACE GUIDES\n"
                     "Private guide storage"
                 )
                 node["tile_color"].setValue(0x3B6E8FFF)
@@ -685,7 +685,7 @@ def ensure_guide_node(source_read=None, controller=None, show=True):
             name=_guide_name_for_controller(controller)
         )
         node["label"].setValue(
-            "AUTOLENS SURFACE GUIDES\\n"
+            "AUTOLENS SURFACE GUIDES\n"
             "Draw rough Floor / Wall / Surface shapes here"
         )
         node["tile_color"].setValue(0x3B6E8FFF)
@@ -1279,7 +1279,7 @@ def restore_surface_guides_from_output(
 
     try:
         node["label"].setValue(
-            "AUTOLENS SURFACE GUIDES\\n"
+            "AUTOLENS SURFACE GUIDES\n"
             f"Restored from {path.parent.name} • frame {frame}"
         )
     except Exception:

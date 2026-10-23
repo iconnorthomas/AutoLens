@@ -2432,10 +2432,10 @@ def show_autolens_dialog(controller_node):
         # Include the exception type; much more useful than Nuke's generic popup.
         import traceback
         details = traceback.format_exc()
-        nuke.tprint("[AutoLens] Failed to open workspace:\\n" + details)
+        nuke.tprint("[AutoLens] Failed to open workspace:\n" + details)
         nuke.message(
-            "AutoLens could not open the workspace.\\n\\n"
-            f"{type(exc).__name__}: {exc}\\n\\n"
+            "AutoLens could not open the workspace.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
             "The full traceback was printed to Nuke's Script Editor."
         )
         return None

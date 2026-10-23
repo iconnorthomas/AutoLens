@@ -611,7 +611,7 @@ def create_autolens_node():
     source = _selected_input()
 
     node = nuke.nodes.Group(name="AutoLens")
-    node["label"].setValue("AutoLens\\nReady")
+    node["label"].setValue("AutoLens\nReady")
     node["tile_color"].setValue(0x356B8FFF)
 
     node.begin()
@@ -660,7 +660,7 @@ def set_status(node, text, percent=None):
     try:
         if node.knob("autolens_status"):
             node["autolens_status"].setValue(str(text))
-        label = "AutoLens\\n" + str(text)
+        label = "AutoLens\n" + str(text)
         if percent is not None and 0 < int(percent) < 100:
             label += f" {int(percent)}%"
         node["label"].setValue(label)
@@ -701,23 +701,23 @@ def auto_suggest_surfaces_for_node(node):
             object_text = ", ".join(object_created) if object_created else "none"
 
             nuke.message(
-                f"AutoLens created {len(created)} editable surface guide shape(s) at frame {int(nuke.frame())}.\\n\\n"
-                f"Room-layout confidence: {confidence:.2f}\\n"
-                f"Room surfaces: {room_text}\\n"
-                f"Local object planes: {object_text}\\n\\n"
+                f"AutoLens created {len(created)} editable surface guide shape(s) at frame {int(nuke.frame())}.\n\n"
+                f"Room-layout confidence: {confidence:.2f}\n"
+                f"Room surfaces: {room_text}\n"
+                f"Local object planes: {object_text}\n\n"
                 "ObjectPlane shapes are general planar-face guesses — for example a fridge face, "
-                "counter front/top, cabinet face, tabletop, door, or other bounded flat surface.\\n\\n"
+                "counter front/top, cabinet face, tabletop, door, or other bounded flat surface.\n\n"
                 "Adjust, rename, or delete the Roto shapes before solving."
             )
         else:
             set_status(node, "No reliable auto surfaces")
             nuke.message(
                 "AutoLens did not find enough coherent perspective or bounded planar-edge evidence "
-                "to suggest useful surfaces on this frame.\\n\\n"
+                "to suggest useful surfaces on this frame.\n\n"
                 "Try another frame or draw the surfaces manually."
             )
     except Exception as exc:
-        nuke.message(f"Auto Suggest Surfaces failed:\\n\\n{exc}")
+        nuke.message(f"Auto Suggest Surfaces failed:\n\n{exc}")
 
 
 def set_surface_guide_frame(node):
@@ -785,23 +785,37 @@ def _ensure_source_input_label(node):
             pass
 
 
+KNOB_CHANGED_COMMAND = (
+    "import nuke\n"
+    "import autolens.node as _al\n"
+    "_al.autolens_knob_changed(nuke.thisNode(), nuke.thisKnob())"
+)
+
+# Older builds stored the callback with a literal backslash-n instead of line
+# breaks, which raises a SyntaxError on every knob change.
+_BROKEN_KNOB_CHANGED_COMMAND = KNOB_CHANGED_COMMAND.replace("\n", "\\n")
+
+
+def knob_changed_script(existing):
+    """The knobChanged script with a working AutoLens callback, or None when unchanged."""
+    existing = existing or ""
+    if _BROKEN_KNOB_CHANGED_COMMAND in existing:
+        return existing.replace(_BROKEN_KNOB_CHANGED_COMMAND, KNOB_CHANGED_COMMAND)
+    if "_al.autolens_knob_changed" in existing:
+        return None
+    if existing.strip():
+        return existing.rstrip() + "\n" + KNOB_CHANGED_COMMAND
+    return KNOB_CHANGED_COMMAND
+
+
 def _install_knob_changed_callback(node):
     if node is None or not node.knob("knobChanged"):
         return
 
-    marker = "_al.autolens_knob_changed"
-    command = (
-        "import nuke\\n"
-        "import autolens.node as _al\\n"
-        "_al.autolens_knob_changed(nuke.thisNode(), nuke.thisKnob())"
-    )
-
     try:
-        existing = node["knobChanged"].value() or ""
-        if marker not in existing:
-            if existing.strip():
-                existing = existing.rstrip() + "\\n"
-            node["knobChanged"].setValue(existing + command)
+        script = knob_changed_script(node["knobChanged"].value())
+        if script is not None:
+            node["knobChanged"].setValue(script)
     except Exception:
         pass
 
