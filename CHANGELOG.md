@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Fast scrubbing and real-time playback in the workspace viewer.** Frames are decoded on
+  background threads at viewer size into a memory-bounded cache (1 GB by default; set
+  `AUTOLENS_PREVIEW_CACHE_MB` to change it), and neighbouring frames are prefetched. Dragging
+  the timeline shows the nearest cached frame at once; Nuke's frame, the surfaces and the mask
+  overlay follow when the drag settles. New transport bar: first/previous/play backwards/play/
+  next/last, Loop and an fps box (defaults to the script's fps). Playback stays in real time and
+  skips frames that aren't ready. Keys: Space play/pause, ←/→ or ,/. step (Shift = 10 frames),
+  Home/End. A green bar under the timeline shows cached frames.
+- **EXR, DPX and other formats Qt can't read** are rendered by Nuke once into a 2K JPEG proxy
+  sequence in the temp folder, keyed by the Read's path and file date, instead of one temporary
+  PNG per frame change. **Cache** renders the missing proxies in one pass and decodes the whole
+  range; **Clear** forgets them (use it after changing nodes between the Read and AutoLens).
+  Proxy folders unused for 7 days are deleted.
+- Zoom and pan are kept while stepping or playing; zooming in on a JPEG/PNG plate loads the
+  settled frame at full resolution.
+- Fix: the workspace's keyboard shortcuts used `QtGui.QShortcut`, which only exists in Qt 6;
+  PySide2 (Nuke 14/15) has it in `QtWidgets`.
+
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep

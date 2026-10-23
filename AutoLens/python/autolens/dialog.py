@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
-import uuid
+import time
 from pathlib import Path
 import re
 
@@ -16,6 +17,24 @@ except ImportError:
     Signal = QtCore.Signal
 
 from . import __version__
+from .frame_cache import (
+    CACHE_MB_ENV,
+    PlaybackClock,
+    bucket_width,
+    cache_budget_bytes,
+    clamp_frame,
+    contiguous_runs,
+    expand_frame_pattern,
+    is_directly_readable,
+    merge_runs,
+    nearest_cached,
+    prefetch_order,
+    prune_old_dirs,
+    proxy_frame_name,
+    proxy_key,
+    step_frame,
+)
+from .preview_loader import PreviewLoader, supported_extensions
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
 from .surface_guides import (
@@ -38,6 +57,9 @@ from .tracking_masks import (
 
 _DIALOGS = {}
 
+# Nuke-rendered preview proxies (EXR, DPX...) are capped at this width.
+PROXY_MAX_WIDTH = 2048.0
+
 LEFT_BUTTON = getattr(
     QtCore.Qt,
     "LeftButton",
@@ -58,6 +80,26 @@ ALIGN_CENTER = getattr(
     "AlignCenter",
     getattr(getattr(QtCore.Qt, "AlignmentFlag", object()), "AlignCenter", 0),
 )
+
+
+NO_FOCUS = getattr(
+    QtCore.Qt,
+    "NoFocus",
+    getattr(getattr(QtCore.Qt, "FocusPolicy", object()), "NoFocus", 0),
+)
+CLICK_FOCUS = getattr(
+    QtCore.Qt,
+    "ClickFocus",
+    getattr(getattr(QtCore.Qt, "FocusPolicy", object()), "ClickFocus", 2),
+)
+PRECISE_TIMER = getattr(
+    QtCore.Qt,
+    "PreciseTimer",
+    getattr(getattr(QtCore.Qt, "TimerType", object()), "PreciseTimer", 0),
+)
+
+# Qt 5 (PySide2, Nuke 14/15) has QShortcut in QtWidgets; Qt 6 moved it to QtGui.
+QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
 
 
 WIDGET_WITH_CHILDREN_SHORTCUT = getattr(
@@ -115,11 +157,14 @@ class SurfaceCanvas(QtWidgets.QWidget):
 
     surfacesChanged = Signal(list)
     selectionChanged = Signal(int)
+    zoomChanged = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.setMouseTracking(True)
+        # Click focus so arrow keys reach the dialog's frame stepping.
+        self.setFocusPolicy(CLICK_FOCUS)
         self.setMinimumSize(600, 420)
 
         self.pixmap = QtGui.QPixmap()
@@ -147,16 +192,29 @@ class SurfaceCanvas(QtWidgets.QWidget):
     # Data
     # ------------------------------------------------------------------
     def set_image(self, pixmap, width, height, pixel_aspect=1.0):
+        # `pixmap` may be a viewer-sized proxy; width/height are the plate's
+        # real size, which surface coordinates use.
         self.pixmap = pixmap or QtGui.QPixmap()
-        self.image_width = max(1, int(width))
-        self.image_height = max(1, int(height))
+        width = max(1, int(width))
+        height = max(1, int(height))
         try:
             pa = float(pixel_aspect)
         except Exception:
             pa = 1.0
-        self.pixel_aspect = pa if pa > 0.0 else 1.0
-        self.zoom = 1.0
-        self.pan = QtCore.QPointF(0.0, 0.0)
+        pa = pa if pa > 0.0 else 1.0
+
+        # Keep zoom/pan while stepping or playing through the same plate.
+        if (width, height, pa) != (
+            self.image_width,
+            self.image_height,
+            self.pixel_aspect,
+        ):
+            self.zoom = 1.0
+            self.pan = QtCore.QPointF(0.0, 0.0)
+
+        self.image_width = width
+        self.image_height = height
+        self.pixel_aspect = pa
         self.update()
 
     def set_surfaces(
@@ -613,6 +671,7 @@ class SurfaceCanvas(QtWidgets.QWidget):
 
         self.zoom = new_zoom
         self.update()
+        self.zoomChanged.emit(float(new_zoom))
 
         try:
             event.accept()
@@ -624,6 +683,8 @@ class GuideTimeline(QtWidgets.QWidget):
     """Compact Mocha-style shot timeline with guide-frame markers."""
 
     frameChanged = Signal(int)
+    scrubStarted = Signal()
+    scrubFinished = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -631,9 +692,26 @@ class GuideTimeline(QtWidgets.QWidget):
         self.last_frame = 100
         self.current_frame = 1
         self.markers = []
+        # (start, end) runs: decoded in memory / rendered proxies on disk.
+        self.cached_ranges = []
+        self.disk_ranges = []
+        self.scrubbing = False
         self.setMinimumHeight(52)
         self.setMaximumHeight(64)
         self.setMouseTracking(True)
+        self.setFocusPolicy(CLICK_FOCUS)
+
+    def set_cached_ranges(self, memory_ranges, disk_ranges=()):
+        memory_ranges = list(memory_ranges or [])
+        disk_ranges = list(disk_ranges or [])
+        if (
+            memory_ranges == self.cached_ranges
+            and disk_ranges == self.disk_ranges
+        ):
+            return
+        self.cached_ranges = memory_ranges
+        self.disk_ranges = disk_ranges
+        self.update()
 
     def set_range(self, first_frame, last_frame):
         self.first_frame = int(first_frame)
@@ -782,6 +860,26 @@ class GuideTimeline(QtWidgets.QWidget):
                 y + 5,
             )
 
+        # Cache bar under the ruler, like Nuke's viewer: dark green = proxy
+        # rendered to disk, bright green = decoded and ready to play.
+        for ranges, color in (
+            (self.disk_ranges, QtGui.QColor(40, 95, 50)),
+            (self.cached_ranges, QtGui.QColor(80, 200, 95)),
+        ):
+            for start, end in ranges:
+                x0 = int(round(self._x_for_frame(start - 0.5)))
+                x1 = int(round(self._x_for_frame(end + 0.5)))
+                x0 = max(left, x0)
+                x1 = min(right, x1)
+                if x1 >= x0:
+                    painter.fillRect(
+                        x0,
+                        y + 7,
+                        max(1, x1 - x0),
+                        3,
+                        color,
+                    )
+
         # Guided frames = blue marks.
         painter.setPen(
             QtGui.QPen(
@@ -867,6 +965,8 @@ class GuideTimeline(QtWidgets.QWidget):
         frame = self._frame_for_x(
             pos.x()
         )
+        self.scrubbing = True
+        self.scrubStarted.emit()
         self.set_current_frame(frame)
         self.frameChanged.emit(frame)
 
@@ -881,8 +981,16 @@ class GuideTimeline(QtWidgets.QWidget):
             frame = self._frame_for_x(
                 pos.x()
             )
+            # Many mouse moves land on the same frame; only report changes.
+            if frame == self.current_frame:
+                return
             self.set_current_frame(frame)
             self.frameChanged.emit(frame)
+
+    def mouseReleaseEvent(self, event):
+        if self.scrubbing:
+            self.scrubbing = False
+            self.scrubFinished.emit(int(self.current_frame))
 
 
 class AutoLensBackgroundMonitor(QtWidgets.QDialog):
@@ -1190,10 +1298,12 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         self.timeline = GuideTimeline()
         viewer_layout.addWidget(self.timeline)
+        self._build_playback_bar(viewer_layout)
 
         viewer_help = QtWidgets.QLabel(
             "Drag surface corners directly in this viewer.  "
             "Timeline: click/drag frame  •  Blue = surface guide frame  •  "
+            "Green = cached  •  Space: play/pause  •  ←/→ or ,/.: step  •  "
             "F: fit  •  Mouse wheel: zoom  •  Middle-drag: pan"
         )
         viewer_help.setStyleSheet("color: #888; padding: 3px;")
@@ -1346,7 +1456,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
 
     def _install_shortcuts(self):
-        self.fit_shortcut = QtGui.QShortcut(
+        self.fit_shortcut = QShortcut(
             QtGui.QKeySequence("F"),
             self,
         )
@@ -1356,6 +1466,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.fit_shortcut.activated.connect(
             self._fit_shortcut_triggered
         )
+        self._install_playback_shortcuts()
 
     def _fit_shortcut_triggered(self):
         # Don't steal F while the artist is actively typing text/numbers in
@@ -1427,27 +1538,20 @@ class AutoLensDialog(QtWidgets.QDialog):
 
 
     def _timeline_frame_changed(self, frame):
-        try:
-            nuke.frame(
-                int(frame)
-            )
-        except Exception:
-            pass
-
-        self.frame_label.setText(
-            f"Frame {int(frame)}"
+        # While dragging, show whatever is cached right away; Nuke's frame,
+        # surfaces, mask overlay and any proxy render follow once the drag
+        # settles (mouse release or a short pause).
+        self._stop_playback(settle=False)
+        frame = int(frame)
+        previous = self._view_frame
+        direction = 0
+        if previous is not None and frame != previous:
+            direction = 1 if frame > previous else -1
+        self._show_frame(
+            frame,
+            settle=not self.timeline.scrubbing,
+            direction=direction,
         )
-        self.canvas.set_current_frame(
-            int(frame)
-        )
-        self._load_preview()
-        self._reload_surfaces()
-
-        if (
-            self.sidebar.currentIndex()
-            == self.masks_tab_index
-        ):
-            self._refresh_mask_preview()
 
 
     def _sidebar_tab_changed(self, index):
@@ -1804,12 +1908,14 @@ class AutoLensDialog(QtWidgets.QDialog):
     # Preview
     # ------------------------------------------------------------------
     def _load_preview(self):
+        """Point the viewer at the source Read and show Nuke's current frame."""
         self.frame_label.setText(f"Frame {int(nuke.frame())}")
 
         read = self.read_node or source_read_for_node(self.controller_node)
         if read is None:
             self.workspace_status.setText("No upstream Read node.")
             self.canvas.set_image(QtGui.QPixmap(), 1, 1)
+            self._preview_mode = None
             return
 
         self.read_node = read
@@ -1820,9 +1926,6 @@ class AutoLensDialog(QtWidgets.QDialog):
             read,
         )
         frame = int(frame_info["frame"])
-        if hasattr(self, "timeline"):
-            self.timeline.set_current_frame(frame)
-
 
         if frame_info["clamped"]:
             try:
@@ -1830,88 +1933,824 @@ class AutoLensDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        self.workspace_status.setText("Loading preview…")
-        QtWidgets.QApplication.processEvents()
-
-        pixmap = QtGui.QPixmap()
-
-        # Fast path: let Qt load common image formats directly.
-        old_frame = int(nuke.frame())
-        filename = ""
-        try:
-            nuke.frame(frame)
-            try:
-                filename = nuke.filename(read) or read["file"].evaluate()
-            except Exception:
-                filename = read["file"].evaluate()
-        finally:
-            nuke.frame(old_frame)
-
-        if filename and Path(filename).exists():
-            pixmap = QtGui.QPixmap(filename)
-
-        # Robust path: ask Nuke to render one temporary PNG. This also handles
-        # EXR/TIFF formats Qt cannot decode itself.
-        if pixmap.isNull():
-            temp_path = Path(tempfile.gettempdir()) / (
-                f"autolens_preview_{uuid.uuid4().hex}.png"
+        # The timeline range bounds stepping and playback.
+        frame_range = source_frame_range(read)
+        if frame_range:
+            self.timeline.set_range(frame_range[0], frame_range[1])
+        else:
+            self.timeline.set_range(
+                min(frame, self.timeline.first_frame),
+                max(frame, self.timeline.last_frame),
             )
-            write = None
-            try:
-                input_node = self.controller_node.input(0) or read
-                write = nuke.nodes.Write()
-                write.setInput(0, input_node)
-                write["file"].setValue(str(temp_path).replace("\\", "/"))
-                if write.knob("file_type"):
-                    write["file_type"].setValue("png")
-                if write.knob("channels"):
-                    write["channels"].setValue("rgb")
 
-                nuke.execute(write.name(), frame, frame)
-                pixmap = QtGui.QPixmap(str(temp_path))
-            except Exception as exc:
-                self.workspace_status.setText(
-                    f"Preview render failed: {exc}"
-                )
-            finally:
-                if write is not None:
-                    try:
-                        nuke.delete(write)
-                    except Exception:
-                        pass
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
+        self._setup_preview_source(read, force=True)
+        self._show_frame(frame, settle=False)
+        self._settle_frame(frame, refresh_surfaces=False)
 
-        try:
-            pixel_aspect = float(read.format().pixelAspect())
-        except Exception:
-            pixel_aspect = 1.0
+        if frame_info["clamped"] and self._view_exact:
+            self.workspace_status.setText(
+                self.workspace_status.text()
+                + f" • auto-clamped from {requested_frame} "
+                f"to source range {frame_info['first']}–{frame_info['last']}"
+            )
 
-        self.canvas.set_image(
-            pixmap,
-            int(read.width()),
-            int(read.height()),
-            pixel_aspect=pixel_aspect,
+    # ------------------------------------------------------------------
+    # Preview source, frame cache and playback
+    # ------------------------------------------------------------------
+    def _build_playback_bar(self, layout):
+        """Transport controls under the timeline, plus the frame cache."""
+        self._view_frame = None
+        self._view_exact = False
+        self._displayed_frame = None
+        self._preview_mode = None          # "direct", "render" or None
+        self._preview_info = {}
+        self._preview_signature = None
+        self._preview_force_render = False
+        self._proxy_frames = set()
+        self._proxies_pruned = False
+        self._play_clock = None
+        self._play_shown = 0
+        self._play_held = 0
+        self._play_stats_time = 0.0
+        self._qt_formats = supported_extensions()
+
+        self._preview = PreviewLoader(
+            self,
+            cache_budget_bytes(),
+            workers=min(4, max(2, (os.cpu_count() or 4) // 2)),
+        )
+        self._preview.on_frames_ready = self._preview_frames_ready
+        self._preview.on_frame_failed = self._preview_frame_failed
+        self._preview.on_full_ready = self._preview_full_ready
+
+        self._play_timer = QtCore.QTimer(self)
+        self._play_timer.setTimerType(PRECISE_TIMER)
+        self._play_timer.timeout.connect(self._playback_tick)
+
+        self._settle_timer = QtCore.QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(150)
+        self._settle_timer.timeout.connect(
+            lambda: self._settle_frame(self._view_frame)
         )
 
-        if pixmap.isNull():
+        self._sharp_timer = QtCore.QTimer(self)
+        self._sharp_timer.setSingleShot(True)
+        self._sharp_timer.setInterval(250)
+        self._sharp_timer.timeout.connect(self._request_sharp)
+
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(4, 0, 4, 0)
+        bar.setSpacing(3)
+
+        def button(text, tip, slot, width=34):
+            b = QtWidgets.QPushButton(text)
+            b.setToolTip(tip)
+            b.setFixedWidth(width)
+            # Keep keyboard focus off the transport so Space always plays.
+            b.setFocusPolicy(NO_FOCUS)
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+            return b
+
+        button("|<", "First frame (Home)", lambda: self._go_to_end(-1))
+        button("<", "Previous frame (← or ,)", lambda: self._step(-1))
+        self.play_back_button = button(
+            "◀", "Play backwards", lambda: self._toggle_playback(-1)
+        )
+        self.play_button = button(
+            "▶", "Play / pause (Space)", lambda: self._toggle_playback(1)
+        )
+        button(">", "Next frame (→ or .)", lambda: self._step(1))
+        button(">|", "Last frame (End)", lambda: self._go_to_end(1))
+
+        self.loop_button = QtWidgets.QPushButton("Loop")
+        self.loop_button.setCheckable(True)
+        self.loop_button.setChecked(True)
+        self.loop_button.setFocusPolicy(NO_FOCUS)
+        self.loop_button.setToolTip("Loop playback over the source range")
+        bar.addWidget(self.loop_button)
+
+        bar.addSpacing(6)
+        self.fps_spin = QtWidgets.QDoubleSpinBox()
+        self.fps_spin.setRange(1.0, 120.0)
+        self.fps_spin.setDecimals(3)
+        self.fps_spin.setSuffix(" fps")
+        self.fps_spin.setToolTip(
+            "Playback speed. Frames that aren't decoded in time are skipped "
+            "so playback stays in real time."
+        )
+        try:
+            fps = float(nuke.root()["fps"].value())
+        except Exception:
+            fps = 24.0
+        self.fps_spin.setValue(fps if fps > 0 else 24.0)
+        bar.addWidget(self.fps_spin)
+
+        bar.addStretch(1)
+
+        self.cache_label = QtWidgets.QLabel("")
+        self.cache_label.setStyleSheet("color: #888;")
+        bar.addWidget(self.cache_label)
+
+        button(
+            "Cache",
+            "Decode the whole range into memory for smooth playback. "
+            "EXR/DPX and other formats Qt can't read are first rendered "
+            "once to a JPEG proxy sequence in the temp folder.",
+            self._cache_all_frames,
+            width=64,
+        )
+        button(
+            "Clear",
+            "Forget cached frames and delete this shot's proxy files "
+            "(use after changing nodes upstream of AutoLens).",
+            self._clear_frame_cache,
+            width=52,
+        )
+
+        layout.addLayout(bar)
+
+        self.timeline.scrubStarted.connect(
+            lambda: self._stop_playback(settle=False)
+        )
+        self.timeline.scrubFinished.connect(self._settle_frame)
+        self.canvas.zoomChanged.connect(
+            lambda _zoom: self._sharp_timer.start()
+        )
+        self.finished.connect(self._shutdown_preview)
+
+    def _install_playback_shortcuts(self):
+        self.playback_shortcuts = []
+        for keys, slot in (
+            ("Space", lambda: self._toggle_playback(0)),
+            (",", lambda: self._step(-1)),
+            (".", lambda: self._step(1)),
+        ):
+            shortcut = QShortcut(QtGui.QKeySequence(keys), self)
+            shortcut.setContext(WIDGET_WITH_CHILDREN_SHORTCUT)
+            shortcut.activated.connect(
+                lambda slot=slot: None if self._typing_in_field() else slot()
+            )
+            self.playback_shortcuts.append(shortcut)
+
+    def _typing_in_field(self):
+        focus = QtWidgets.QApplication.focusWidget()
+        return isinstance(
+            focus,
+            (
+                QtWidgets.QLineEdit,
+                QtWidgets.QTextEdit,
+                QtWidgets.QPlainTextEdit,
+                QtWidgets.QAbstractSpinBox,
+                QtWidgets.QComboBox,
+            ),
+        )
+
+    def keyPressEvent(self, event):
+        # Arrow keys reach here when the viewer/timeline (or anything that
+        # doesn't use them itself) has focus. Shift steps 10 frames.
+        key = event.key()
+        try:
+            shift = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+        except Exception:
+            shift = False
+        if key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
+            delta = 10 if shift else 1
+            self._step(delta if key == QtCore.Qt.Key_Right else -delta)
+            event.accept()
+            return
+        if key in (QtCore.Qt.Key_Home, QtCore.Qt.Key_End):
+            self._go_to_end(1 if key == QtCore.Qt.Key_End else -1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # Source -----------------------------------------------------------
+    def _read_signature(self, read):
+        """Everything that changes which pixels the Read delivers."""
+        parts = []
+        try:
+            parts.append(read.fullName())
+            parts.append(nuke.filename(read) or "")
+            for name in (
+                "file", "proxy", "first", "last", "frame_mode", "frame",
+                "colorspace", "raw", "premultiplied",
+            ):
+                knob = read.knob(name)
+                parts.append(knob.value() if knob is not None else None)
+            parts.append((int(read.width()), int(read.height())))
+            upstream = self.controller_node.input(0)
+            parts.append(upstream.fullName() if upstream is not None else "")
+        except Exception:
+            pass
+        parts.append(self._preview_force_render)
+        return tuple(str(p) for p in parts)
+
+    def _viewer_decode_width(self):
+        try:
+            ratio = float(self.canvas.devicePixelRatioF())
+        except Exception:
+            ratio = 1.0
+        return bucket_width(max(320, self.canvas.width()) * ratio)
+
+    def _evaluated_filename(self, read, frame):
+        """The Read's file for one frame, evaluated by Nuke (main thread)."""
+        old_frame = int(nuke.frame())
+        try:
+            if old_frame != int(frame):
+                nuke.frame(int(frame))
+            try:
+                return nuke.filename(read, nuke.REPLACE) or read["file"].evaluate()
+            except Exception:
+                return read["file"].evaluate()
+        except Exception:
+            return ""
+        finally:
+            if int(nuke.frame()) != old_frame:
+                nuke.frame(old_frame)
+
+    def _setup_preview_source(self, read, force=False):
+        """Pick how frames are loaded and point the cache at them.
+
+        direct: Qt reads the Read's files itself (JPEG/PNG/TIFF...), decoded on
+                worker threads, any frame, at any time.
+        render: formats Qt can't read (EXR, DPX, movies) are rendered by Nuke
+                once into a JPEG proxy sequence keyed by path, mtime and size;
+                the proxies are then decoded like a direct sequence.
+        """
+        signature = self._read_signature(read)
+        max_w = self._viewer_decode_width()
+        if not force and signature == self._preview_signature and self._preview_mode:
+            # Same plate; only a bigger viewer needs a fresh cache.
+            self._preview.set_source(
+                self._preview.source,
+                self._preview_path_for_frame,
+                max_w,
+                self._preview_info.get("pa", 1.0),
+            )
+            return
+
+        self._preview_signature = signature
+        width = max(1, int(read.width()))
+        height = max(1, int(read.height()))
+        try:
+            pa = float(read.format().pixelAspect())
+        except Exception:
+            pa = 1.0
+        pa = pa if pa > 0 else 1.0
+
+        frame = self._view_frame
+        if frame is None:
+            frame = int(nuke.frame())
+        try:
+            pattern = nuke.filename(read) or ""
+        except Exception:
+            pattern = ""
+        evaluated = self._evaluated_filename(read, frame)
+
+        frame_knob = read.knob("frame")
+        remapped = bool(
+            frame_knob is not None and str(frame_knob.value()).strip()
+        )
+        direct = False
+        if (
+            pattern
+            and evaluated
+            and not remapped
+            and not self._preview_force_render
+            and is_directly_readable(evaluated, self._qt_formats)
+        ):
+            # Only trust our own frame substitution if it reproduces Nuke's
+            # file name for this frame; anything cleverer goes through Nuke.
+            expanded = expand_frame_pattern(pattern, frame)
+            direct = os.path.normcase(os.path.normpath(expanded)) == (
+                os.path.normcase(os.path.normpath(evaluated))
+            )
+
+        info = {"width": width, "height": height, "pa": pa}
+        if direct:
+            info["pattern"] = pattern
+            self._preview_mode = "direct"
+            self._proxy_frames = set()
+            source = ("direct", pattern, width, height)
+        else:
+            # Proxies hold display pixels, so cap them at 2K: plenty for a
+            # guide editor, and quick to write and decode.
+            scale = min(1.0, PROXY_MAX_WIDTH / float(width))
+            try:
+                stat = os.stat(evaluated)
+                stamp = (int(stat.st_mtime), int(stat.st_size))
+            except Exception:
+                stamp = None
+            key = proxy_key(*(signature + (stamp, round(scale, 4))))
+            root = os.path.join(tempfile.gettempdir(), "autolens_proxies")
+            info["proxy_dir"] = os.path.join(root, key)
+            info["proxy_scale"] = scale
+            if not self._proxies_pruned:
+                self._proxies_pruned = True
+                prune_old_dirs(root, 7.0, keep={key})
+            self._preview_mode = "render"
+            self._proxy_frames = self._scan_proxies(info["proxy_dir"])
+            source = ("render", key, width, height)
+
+        self._preview_info = info
+        self._preview.set_source(source, self._preview_path_for_frame, max_w, pa)
+        self._update_cache_bar()
+
+    def _preview_path_for_frame(self, frame):
+        info = self._preview_info
+        if self._preview_mode == "direct":
+            return expand_frame_pattern(info["pattern"], frame)
+        if self._preview_mode == "render" and frame in self._proxy_frames:
+            return os.path.join(info["proxy_dir"], proxy_frame_name(frame))
+        return None
+
+    def _scan_proxies(self, folder):
+        frames = set()
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return frames
+        for name in names:
+            match = re.match(r"^proxy\.(-?\d+)\.jpg$", name)
+            if match:
+                frames.add(int(match.group(1)))
+        return frames
+
+    def _render_proxies(self, frames, max_gap=0):
+        """Render JPEG proxies for these frames with one Write (main thread).
+
+        Contiguous frames go through a single nuke.execute, which shows Nuke's
+        own progress bar and can be cancelled. Runs separated by up to max_gap
+        already-rendered frames are merged, re-rendering the gap, so a whole
+        range takes one progress bar rather than one per gap.
+        """
+        info = self._preview_info
+        if self._preview_mode != "render" or not frames:
+            return
+        frame_range = source_frame_range(self.read_node)
+        if frame_range:
+            frames = [
+                f for f in frames
+                if frame_range[0] <= f <= frame_range[1]
+            ]
+        frames = sorted(set(frames) - self._proxy_frames)
+        if not frames:
+            return
+
+        folder = info["proxy_dir"]
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as exc:
+            self.workspace_status.setText(f"Proxy folder failed: {exc}")
+            return
+
+        runs = merge_runs(contiguous_runs(frames), max_gap)
+        # Proxies in a merged gap get rewritten: drop their decodes too.
+        rendered = [f for start, end in runs for f in range(start, end + 1)]
+        self._preview.cancel_all()
+        created = []
+        undo = getattr(nuke, "Undo", None)
+        try:
+            if undo is not None:
+                undo.disable()
+        except Exception:
+            undo = None
+        try:
+            source = self.controller_node.input(0) or self.read_node
+            scale = float(info.get("proxy_scale", 1.0))
+            if scale < 0.999:
+                try:
+                    reformat = nuke.nodes.Reformat()
+                    created.append(reformat)
+                    reformat.setInput(0, source)
+                    reformat["type"].setValue("scale")
+                    reformat["scale"].setValue(scale)
+                    source = reformat
+                except Exception:
+                    pass        # full-size proxies still work
+
+            write = nuke.nodes.Write()
+            created.append(write)
+            write.setInput(0, source)
+            write["file"].setValue(
+                folder.replace("\\", "/") + "/proxy.%06d.jpg"
+            )
+            if write.knob("file_type"):
+                write["file_type"].setValue("jpeg")
+            if write.knob("_jpeg_quality"):
+                write["_jpeg_quality"].setValue(0.9)
+            if write.knob("channels"):
+                write["channels"].setValue("rgb")
+
+            for start, end in runs:
+                nuke.execute(write.name(), int(start), int(end), 1)
+        except Exception as exc:
+            # Includes the user cancelling Nuke's progress bar.
+            self.workspace_status.setText(f"Proxy render stopped: {exc}")
+        finally:
+            for node in reversed(created):
+                try:
+                    nuke.delete(node)
+                except Exception:
+                    pass
+            if undo is not None:
+                try:
+                    undo.enable()
+                except Exception:
+                    pass
+            self._proxy_frames = self._scan_proxies(folder)
+            self._preview.forget(rendered)
+            self._update_cache_bar()
+
+    # Frames -----------------------------------------------------------
+    def _show_frame(self, frame, settle=False, direction=0, playing=False):
+        """Put `frame` on screen as fast as possible.
+
+        Cached: shown now. Not cached: the nearest cached frame stands in
+        (held while playing) and the exact frame is decoded in the
+        background; settling then fills in anything still missing.
+        """
+        frame = clamp_frame(
+            frame,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+        )
+        self._view_frame = frame
+        self.timeline.set_current_frame(frame)
+        self.canvas.set_current_frame(frame)
+        self._preview.protect = {frame}
+
+        pixmap = self._preview.pixmap(frame)
+        if pixmap is not None:
+            self._display_pixmap(pixmap, frame)
+        else:
+            self._view_exact = False
+            stand_in = None
+            if playing:
+                stand_in = self._displayed_frame
+            elif self._preview_mode:
+                stand_in = nearest_cached(
+                    frame, self._preview.frames(), direction
+                )
+                if stand_in is not None:
+                    self._display_pixmap(self._preview.pixmap(stand_in), stand_in)
+            label = f"Frame {frame}"
+            if stand_in is not None and stand_in != frame:
+                label += f"  (showing {stand_in})"
+            self.frame_label.setText(label)
+
+        self._request_around(frame, direction)
+
+        if playing:
+            return
+        if settle:
+            self._settle_frame(frame)
+        else:
+            self._settle_timer.start()
+
+    def _display_pixmap(self, pixmap, frame):
+        info = self._preview_info
+        self.canvas.set_image(
+            pixmap,
+            info.get("width", 1),
+            info.get("height", 1),
+            pixel_aspect=info.get("pa", 1.0),
+        )
+        self._displayed_frame = frame
+        self._view_exact = frame == self._view_frame
+        if self._view_exact:
+            self.frame_label.setText(f"Frame {frame}")
+            if self._playing():
+                self._play_shown += 1
+
+    def _request_around(self, frame, direction):
+        if not self._preview_mode:
+            return
+        capacity = self._preview.capacity_frames(
+            self._preview_info.get("width", 1),
+            self._preview_info.get("height", 1),
+        )
+        if self._playing():
+            ahead = max(2, min(96, int(capacity * 0.6)))
+            behind = max(1, min(16, int(capacity * 0.15)))
+        else:
+            ahead = max(1, min(48, int(capacity * 0.4)))
+            behind = max(1, min(16, int(capacity * 0.15)))
+        loop = self._playing() and self.loop_button.isChecked()
+        order = [frame] + prefetch_order(
+            frame,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+            direction,
+            ahead,
+            behind,
+            loop=loop,
+        )
+        self._preview.request(order)
+
+    def _settle_frame(self, frame, refresh_surfaces=True):
+        """Bring Nuke and the rest of the workspace onto the shown frame."""
+        self._settle_timer.stop()
+        if frame is None or self._playing():
+            return
+        frame = int(frame)
+        if frame != self._view_frame:
+            self._show_frame(frame, settle=False)
+            self._settle_timer.stop()
+
+        try:
+            if int(nuke.frame()) != frame:
+                nuke.frame(frame)
+        except Exception:
+            pass
+
+        if self.read_node is not None and self._preview_mode:
+            self._setup_preview_source(self.read_node)
+        elif self.read_node is None:
+            # A Read may have been connected since the dialog opened.
+            read = source_read_for_node(self.controller_node)
+            if read is not None:
+                self.read_node = read
+                self._setup_preview_source(read, force=True)
+
+        if refresh_surfaces:
+            self._reload_surfaces()
+            if self.sidebar.currentIndex() == self.masks_tab_index:
+                self._refresh_mask_preview()
+
+        pixmap = self._preview.pixmap(frame)
+        if pixmap is None and self._preview_mode == "render":
+            self.workspace_status.setText(f"Rendering preview of frame {frame}…")
+            self.workspace_status.repaint()
+            self._render_proxies([frame])
+            pixmap = self._preview.load_now(frame)
+        elif pixmap is None and self._preview_mode == "direct":
+            # Usually already decoding; finish this one frame here so the
+            # settled frame is always the exact one.
+            pixmap = self._preview.load_now(frame)
+            if pixmap is None:
+                self._preview_frame_failed(frame)
+                return
+
+        if pixmap is not None:
+            self._display_pixmap(pixmap, frame)
+            self._request_around(frame, 0)
+            self._sharp_timer.start()
+        self._update_cache_bar()
+        self._update_frame_status()
+
+    def _update_frame_status(self):
+        info = self._preview_info
+        if not self._preview_mode:
+            return
+        if not self._view_exact:
             self.workspace_status.setText(
                 "Preview unavailable; surface data is still editable."
             )
-        else:
-            suffix = ""
-            if frame_info["clamped"]:
-                suffix = (
-                    f" • auto-clamped from {requested_frame} "
-                    f"to source range {frame_info['first']}–{frame_info['last']}"
+            return
+        source = (
+            "direct" if self._preview_mode == "direct" else "Nuke-rendered proxy"
+        )
+        self.workspace_status.setText(
+            f"Frame {self._view_frame} • {info['width']} × {info['height']} "
+            f"• PAR {info['pa']:g} • {source} preview"
+        )
+
+    def _request_sharp(self):
+        # Viewer-sized frames look soft when zoomed in; load the settled frame
+        # at full size for direct sequences.
+        if (
+            self._preview_mode == "direct"
+            and not self._playing()
+            and self.canvas.zoom > 1.25
+            and self._view_frame is not None
+        ):
+            full = self._preview.full
+            if full is not None and full[0] == self._view_frame:
+                self._preview_full_ready(self._view_frame)
+            else:
+                self._preview.request_full(self._view_frame)
+
+    def _preview_full_ready(self, frame):
+        full = self._preview.full
+        if (
+            full is not None
+            and frame == self._view_frame
+            and not self._playing()
+            and self._view_exact
+        ):
+            self._display_pixmap(full[1], frame)
+
+    def _preview_frames_ready(self, frames):
+        if self._view_frame in frames and not self._view_exact:
+            self._display_pixmap(self._preview.pixmap(self._view_frame), self._view_frame)
+            if not self._playing() and not self._settle_timer.isActive():
+                self._update_frame_status()
+        self._update_cache_bar()
+
+    def _preview_frame_failed(self, frame):
+        if self._preview_mode != "direct" or frame != self._view_frame:
+            return
+        path = self._preview_path_for_frame(frame)
+        if path and os.path.isfile(path) and not self._preview_force_render:
+            # The file is there but this Qt can't decode it (float TIFF, odd
+            # PNG...): let Nuke render proxies for this plate instead.
+            self._preview_force_render = True
+            QtCore.QTimer.singleShot(0, self._reload_preview_source)
+        elif not self._playing():
+            self.workspace_status.setText(
+                f"Frame {frame}: file missing ({path}); "
+                "surface data is still editable."
+            )
+
+    def _reload_preview_source(self):
+        if self.read_node is None:
+            return
+        self._setup_preview_source(self.read_node, force=True)
+        self._settle_frame(self._view_frame)
+
+    def _update_cache_bar(self):
+        frames = self._preview.frames()
+        disk = self._proxy_frames if self._preview_mode == "render" else ()
+        self.timeline.set_cached_ranges(
+            contiguous_runs(frames),
+            contiguous_runs(disk),
+        )
+        used = self._preview.cache.total_bytes / (1024.0 * 1024.0)
+        budget = self._preview.cache.max_bytes / (1024.0 * 1024.0)
+        text = f"{len(frames)} cached • {used:.0f}/{budget:.0f} MB"
+        if disk:
+            text = f"{len(disk)} proxies • " + text
+        self.cache_label.setText(text)
+
+    # Transport --------------------------------------------------------
+    def _playing(self):
+        return self._play_timer.isActive()
+
+    def _toggle_playback(self, direction=0):
+        """direction 0 (Space): pause, or play forwards. A play button
+        pauses its own direction and reverses the other."""
+        if self._playing():
+            same = direction == 0 or (
+                self._play_clock is not None
+                and self._play_clock.direction == (1 if direction > 0 else -1)
+            )
+            self._stop_playback(settle=same)
+            if same:
+                return
+        self._start_playback(direction or 1)
+
+    def _start_playback(self, direction=1):
+        if self._view_frame is None or not self._preview_mode:
+            return
+        self._settle_timer.stop()
+        fps = float(self.fps_spin.value())
+        self._play_clock = PlaybackClock(
+            fps,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+            loop=self.loop_button.isChecked(),
+            direction=direction,
+        )
+        frame = self._play_clock.start(self._view_frame)
+        self._play_shown = 0
+        self._play_held = 0
+        self._play_stats_time = time.monotonic()
+        # Tick at twice the frame rate so frames land close to on time.
+        self._play_timer.start(max(1, int(500.0 / fps)))
+        self._sync_play_buttons()
+        self._show_frame(frame, direction=direction, playing=True)
+        if self._preview_mode == "render":
+            missing = (
+                self.timeline.last_frame - self.timeline.first_frame + 1
+                - len(self._proxy_frames)
+            )
+            if missing > 0:
+                self.workspace_status.setText(
+                    f"Playing proxies only: {missing} frames not rendered yet. "
+                    "Click Cache to render them once."
                 )
 
-            self.workspace_status.setText(
-                f"Frame {frame} • {read.width()} × {read.height()} "
-                f"• PAR {pixel_aspect:g}{suffix}"
+    def _stop_playback(self, settle=True):
+        if not self._playing():
+            return
+        self._play_timer.stop()
+        self._sync_play_buttons()
+        if settle:
+            self._settle_frame(self._view_frame)
+
+    def _playback_tick(self):
+        if not self.isVisible() or self._play_clock is None:
+            self._stop_playback(settle=False)
+            return
+        frame, finished = self._play_clock.target()
+        if frame != self._view_frame:
+            if self._preview.pixmap(frame) is None:
+                self._play_held += 1
+            self._show_frame(
+                frame,
+                direction=self._play_clock.direction,
+                playing=True,
             )
+
+        now = time.monotonic()
+        if now - self._play_stats_time >= 1.0:
+            shown = self._play_shown / (now - self._play_stats_time)
+            self.workspace_status.setText(
+                f"Playing {self._play_clock.fps:g} fps • showing {shown:.1f} fps"
+                + (
+                    f" • {self._play_held} frames not ready"
+                    if self._play_held else ""
+                )
+            )
+            self._play_shown = 0
+            self._play_held = 0
+            self._play_stats_time = now
+
+        if finished:
+            self._stop_playback()
+
+    def _sync_play_buttons(self):
+        playing = self._playing()
+        direction = self._play_clock.direction if self._play_clock else 1
+        self.play_button.setText("||" if playing and direction > 0 else "▶")
+        self.play_back_button.setText("||" if playing and direction < 0 else "◀")
+
+    def _step(self, delta):
+        self._stop_playback(settle=False)
+        if self._view_frame is None:
+            return
+        frame = step_frame(
+            self._view_frame,
+            delta,
+            self.timeline.first_frame,
+            self.timeline.last_frame,
+        )
+        # Settles after a short pause, so holding a key steps smoothly.
+        self._show_frame(frame, direction=1 if delta > 0 else -1)
+
+    def _go_to_end(self, which):
+        self._stop_playback(settle=False)
+        frame = self.timeline.last_frame if which > 0 else self.timeline.first_frame
+        self._show_frame(frame, settle=True)
+
+    def _cache_all_frames(self):
+        self._stop_playback()
+        if not self._preview_mode or self._view_frame is None:
+            return
+        first, last = self.timeline.first_frame, self.timeline.last_frame
+        if self._preview_mode == "render":
+            missing = [
+                f for f in range(first, last + 1)
+                if f not in self._proxy_frames
+            ]
+            if missing:
+                self.workspace_status.setText(
+                    f"Rendering {len(missing)} proxy frames…"
+                )
+                self.workspace_status.repaint()
+                self._render_proxies(missing, max_gap=12)
+        capacity = self._preview.capacity_frames(
+            self._preview_info["width"],
+            self._preview_info["height"],
+        )
+        order = [self._view_frame] + prefetch_order(
+            self._view_frame, first, last, 1,
+            ahead=last - first, behind=0, loop=True,
+        )
+        self._preview.request(order[:capacity])
+        span = last - first + 1
+        self.workspace_status.setText(
+            f"Caching {min(span, capacity)} of {span} frames in the background…"
+            + (
+                "" if capacity >= span
+                else f" (memory budget; set {CACHE_MB_ENV} to raise it)"
+            )
+        )
+
+    def _clear_frame_cache(self):
+        self._stop_playback(settle=False)
+        self._preview.cancel_all()
+        self._preview.cache.clear()
+        self._preview.failed.clear()
+        self._preview.full = None
+        folder = self._preview_info.get("proxy_dir")
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+            self._proxy_frames = set()
+        self._update_cache_bar()
+        self._settle_frame(self._view_frame)
+
+    def _shutdown_preview(self, *_args):
+        try:
+            self._play_timer.stop()
+            self._settle_timer.stop()
+            self._sharp_timer.stop()
+            self._preview.shutdown()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Surface editor
