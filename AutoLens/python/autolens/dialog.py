@@ -1231,12 +1231,24 @@ class AutoLensDialog(QtWidgets.QDialog):
         sl = QtWidgets.QVBoxLayout(surfaces_tab)
         sl.setContentsMargins(8, 8, 8, 8)
 
+        surfaces_help = QtWidgets.QLabel(
+            "Optional. Draw a plane over each flat surface you want as projection "
+            "geometry (floor, walls, signs). Skip this tab if you only need the "
+            "camera and lens."
+        )
+        surfaces_help.setWordWrap(True)
+        surfaces_help.setStyleSheet("color: #aaa;")
+        sl.addWidget(surfaces_help)
+
         self.surface_list = QtWidgets.QListWidget()
+        self.surface_list.setToolTip("Surfaces sent to the solve. Select one to edit it in the viewer.")
         sl.addWidget(self.surface_list, 1)
 
         name_row = QtWidgets.QHBoxLayout()
         self.surface_name_edit = QtWidgets.QLineEdit()
         self.rename_button = QtWidgets.QPushButton("Rename")
+        self.surface_name_edit.setToolTip("New name for the selected surface. Its ReadGeo uses this name.")
+        self.rename_button.setToolTip("Rename the selected surface.")
         name_row.addWidget(self.surface_name_edit, 1)
         name_row.addWidget(self.rename_button)
         sl.addLayout(name_row)
@@ -1244,6 +1256,13 @@ class AutoLensDialog(QtWidgets.QDialog):
         row = QtWidgets.QHBoxLayout()
         self.surface_auto_button = QtWidgets.QPushButton("Auto Suggest")
         self.surface_add_button = QtWidgets.QPushButton("Add Plane")
+        self.surface_auto_button.setToolTip(
+            "Guess rough floor, wall and object planes on the current frame. "
+            "Drag their corners to correct them."
+        )
+        self.surface_add_button.setToolTip(
+            "Add a plane on the current frame, then drag its four corners onto a flat surface."
+        )
         row.addWidget(self.surface_auto_button)
         row.addWidget(self.surface_add_button)
         sl.addLayout(row)
@@ -1251,6 +1270,11 @@ class AutoLensDialog(QtWidgets.QDialog):
         row2 = QtWidgets.QHBoxLayout()
         self.surface_delete_button = QtWidgets.QPushButton("Delete")
         self.guide_frame_button = QtWidgets.QPushButton("Set Guide Frame")
+        self.surface_delete_button.setToolTip("Delete the selected surface.")
+        self.guide_frame_button.setToolTip(
+            "Make the current frame the selected surface's guide frame: the frame "
+            "its corners were drawn on. Other surfaces keep their own frames."
+        )
         row2.addWidget(self.surface_delete_button)
         row2.addWidget(self.guide_frame_button)
         sl.addLayout(row2)
@@ -1275,7 +1299,8 @@ class AutoLensDialog(QtWidgets.QDialog):
         ml.addWidget(mask_title)
 
         mask_help = QtWidgets.QLabel(
-            "Connect an alpha/matte to AutoLens input 2. "
+            "Optional. Connect an alpha/matte to AutoLens input 2 to stop moving "
+            "objects (people, cars, reflections) from spoiling the camera solve. "
             "The viewer shows the tracking exclusion region as 20% red. "
             "By default alpha marks areas AutoLens should AVOID while tracking."
         )
@@ -2416,9 +2441,15 @@ class AutoLensDialog(QtWidgets.QDialog):
                 self.controller_node,
                 "Stopped / failed",
             )
-            self.workspace_status.setText(
-                "AutoLens stopped or failed. See the Solve tab log."
-            )
+            failure = getattr(self.panel, "last_failure", None)
+            if failure:
+                self.workspace_status.setText(
+                    f"{failure['title']}. {failure['next_step']}"
+                )
+            else:
+                self.workspace_status.setText(
+                    "AutoLens stopped or failed. See the Solve tab log."
+                )
 
     def closeEvent(self, event):
         if self.panel.runner.is_running():

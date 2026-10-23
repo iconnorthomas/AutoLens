@@ -756,7 +756,7 @@ The selected version controls:
 
 - result availability
 - cache reuse
-- Import Result
+- Create All (formerly Import Result)
 - Create From Solve
 - guide restoration
 - guide-only refresh
@@ -766,10 +766,10 @@ The selected version controls:
 
 # Resume / Cache Reuse
 
-When a selected version contains reusable stages, the Run button changes to:
+When a selected version contains reusable stages, the Solve button changes to:
 
 ```text
-Resume AutoLens
+Resume Solve
 ```
 
 This prevents unnecessary recomputation.

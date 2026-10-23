@@ -35,6 +35,29 @@
 - **Registration coverage** in the log and in `autolens_result.json`
   (`registration_coverage`: unregistered frames, their frame ranges and the longest
   unregistered run), plus a `sparse_recovery` report of every retry rung.
+- **Simpler path from plate to solve** (see `docs/UX_REVIEW.md`).
+  - The Solve tab shows *Setup › Solve › Review › Create* with a next-step hint.
+  - The main action is now one **Solve** button under a Quality preset, and each
+    preset has a plain-language description.
+  - Run mode and GPU options are in the collapsed Advanced section.
+  - The installation box shrinks to one line when everything is installed.
+- **Readable progress.** The status shows *Step n of 11*, elapsed time and a rough
+  time remaining.
+- **Plain-language errors.** A failed solve says what went wrong and what to do next
+  (install, COLMAP, GPU memory, disk, plate, mask, unsolvable camera) instead of
+  "check the log". Cancelling no longer shows an error.
+- **Create All.** *Import Result* is now **Create All** on the node and the Solve tab.
+  It works the same way.
+- **Solve as New Version.** When the selected version already holds a solve, the
+  prompt offers *Solve as New Version* next to *Re-run*.
+- **Node layout.** New AutoLens nodes put **Open AutoLens...** and **Create All** at
+  the top, and move Run mode, Use surface guides and auto-create to the AutoLens
+  Advanced tab. Existing nodes keep their layout and get the new labels.
+- Tooltips on every node knob and Solve / Surfaces / Masks control.
+- **Fix: Create from solve failed for Proxy Mesh, Mesh-fit Planes and Guided Surfaces
+  (Combined)** with `name 'json' is not defined`. Guided surfaces now show their
+  friendly names in the list again.
+
 - **Build label for test installs.** Installing from a git checkout records the branch, commit,
   pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
   shows it next to the version, e.g. `AutoLens 0.10.30 (PR #8 · d9bf93a)`. Release installs show

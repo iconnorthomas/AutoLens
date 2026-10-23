@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import os
 import re
 import tempfile
@@ -19,6 +20,83 @@ from .startup import (
     needs_upgrade,
     timed,
 )
+
+
+# Tooltips for every visible controller knob. Applied to new nodes and, through
+# ensure_runtime_knobs(), to controllers saved by older AutoLens builds.
+_KNOB_TOOLTIPS = {
+    "autolens_status": "What AutoLens is doing now, or the result of the last action.",
+    "autolens_open": (
+        "Open the AutoLens workspace: draw surfaces, preview the tracking mask, "
+        "choose a quality and click Solve."
+    ),
+    "autolens_import_result": (
+        "Create the camera, undistort/redistort lens nodes and all geometry from "
+        "the selected solve version in one go (formerly Import Result). "
+        "Safe to click again after editing surfaces."
+    ),
+    "autolens_result_status": "Whether the selected solve version holds a finished solve.",
+    "autolens_quality": (
+        "Preview: fastest, for checking a shot tracks. Normal: recommended. "
+        "High: densest geometry, slowest."
+    ),
+    "autolens_run_mode": (
+        "Resume reuses every cached stage that is still valid. Rebuild dense only "
+        "keeps the camera solve. Rebuild everything starts the version from scratch."
+    ),
+    "autolens_use_guides": "Fit a projection plane to each surface drawn in the workspace.",
+    "autolens_auto_import": "Run Create All automatically when a solve finishes.",
+    "autolens_output_root": (
+        "Where solves are written. Defaults to an AutoLens folder beside the plate. "
+        "Each solve gets its own version subfolder."
+    ),
+    "autolens_output_browse": "Choose the AutoLens output root.",
+    "autolens_version": (
+        "Latest reuses the newest solve; pick an older version to review it, or "
+        "Create New to keep existing solves untouched."
+    ),
+    "autolens_create_item": (
+        "Pick one solved asset to create on its own. Use Create All for everything."
+    ),
+    "autolens_create_selected": (
+        "Create only the selected solved asset. Individual guided surfaces are "
+        "created as separate ReadGeo nodes."
+    ),
+    "autolens_python": "Python runtime for the AutoLens engine. Set by the installer; leave as is.",
+    "autolens_colmap": "COLMAP install used for solving. Set by the installer; leave as is.",
+}
+
+# Clearer button labels, applied to old controllers too. Knob names are
+# unchanged so saved scripts and callbacks keep working.
+_KNOB_LABELS = {
+    "autolens_open": "Open AutoLens...",
+    "autolens_import_result": "Create All",
+}
+
+
+def _apply_knob_help(node):
+    if node is None:
+        return
+    for name, tip in _KNOB_TOOLTIPS.items():
+        knob = node.knob(name)
+        if knob is None:
+            continue
+        # Only write when different, so opening an old script doesn't mark
+        # it as modified every time the controller is refreshed.
+        try:
+            if knob.tooltip() != tip:
+                knob.setTooltip(tip)
+        except Exception:
+            pass
+    for name, label in _KNOB_LABELS.items():
+        knob = node.knob(name)
+        if knob is None:
+            continue
+        try:
+            if knob.label() != label:
+                knob.setLabel(label)
+        except Exception:
+            pass
 
 
 def _selected_input():
@@ -457,32 +535,42 @@ def _add_knobs(node, source_read=None):
 
     title = nuke.Text_Knob(
         "autolens_title", "",
-        "<b>AutoLens v0.10.30</b><br>Lens solve • camera track • proxy geometry • guided surfaces"
+        f"<b>AutoLens v{__version__}</b><br>Lens solve • camera track • proxy geometry • guided surfaces"
     )
     node.addKnob(title)
 
     status = nuke.Text_Knob("autolens_status", "Status", "Ready")
     node.addKnob(status)
 
+    # Primary actions first: open the workspace to solve, then create the result.
+    node.addKnob(_button(
+        "autolens_open", _KNOB_LABELS["autolens_open"],
+        "import autolens.node as _al; _al.open_dialog(nuke.thisNode())",
+        tooltip=_KNOB_TOOLTIPS["autolens_open"],
+    ))
+
+    import_button = _button(
+        "autolens_import_result", _KNOB_LABELS["autolens_import_result"],
+        "import autolens.node as _al; _al.import_result_for_node(nuke.thisNode())",
+        startline=False,
+        tooltip=_KNOB_TOOLTIPS["autolens_import_result"],
+    )
+    node.addKnob(import_button)
+
+    result_status = nuke.Text_Knob(
+        "autolens_result_status",
+        "",
+        "",
+    )
+    node.addKnob(result_status)
+
+    node.addKnob(nuke.Text_Knob("autolens_sep1", "", ""))
+
     quality = nuke.Enumeration_Knob(
         "autolens_quality", "Quality", ["Preview", "Normal", "High"]
     )
     quality.setValue("Normal")
     node.addKnob(quality)
-
-    mode = nuke.Enumeration_Knob(
-        "autolens_run_mode", "Run mode",
-        ["Resume / reuse cached stages", "Rebuild dense only", "Rebuild everything"]
-    )
-    node.addKnob(mode)
-
-    use_guides = nuke.Boolean_Knob("autolens_use_guides", "Use surface guides")
-    use_guides.setValue(True)
-    node.addKnob(use_guides)
-
-    auto_import = nuke.Boolean_Knob("autolens_auto_import", "Import result when complete")
-    auto_import.setValue(True)
-    node.addKnob(auto_import)
 
     output_root = nuke.String_Knob(
         "autolens_output_root",
@@ -501,7 +589,7 @@ def _add_knobs(node, source_read=None):
         "Browse...",
         "import autolens.node as _al; _al.browse_output_folder(nuke.thisNode())",
         startline=False,
-        tooltip="Choose the AutoLens output root."
+        tooltip=_KNOB_TOOLTIPS["autolens_output_browse"],
     )
     node.addKnob(output_browse)
 
@@ -531,13 +619,6 @@ def _add_knobs(node, source_read=None):
         prefer_latest=True,
     )
 
-    result_status = nuke.Text_Knob(
-        "autolens_result_status",
-        "",
-        "",
-    )
-    node.addKnob(result_status)
-
     result_path = nuke.String_Knob(
         "autolens_result_nk",
         "Last result",
@@ -548,22 +629,6 @@ def _add_knobs(node, source_read=None):
         result_path.setVisible(False)
     except Exception:
         pass
-
-    node.addKnob(nuke.Text_Knob("autolens_sep1", "", ""))
-
-    node.addKnob(_button(
-        "autolens_open", "Setup / Run...",
-        "import autolens.node as _al; _al.open_dialog(nuke.thisNode())",
-        tooltip="Open the AutoLens setup, environment, progress and log window."
-    ))
-
-    import_button = _button(
-        "autolens_import_result", "Import Result",
-        "import autolens.node as _al; _al.import_result_for_node(nuke.thisNode())",
-        startline=False,
-        tooltip="Import or re-import the completed AutoLens result from the current output folder."
-    )
-    node.addKnob(import_button)
 
     node.addKnob(nuke.Text_Knob("autolens_create_sep", "", ""))
 
@@ -579,10 +644,7 @@ def _add_knobs(node, source_read=None):
         "Create",
         "import autolens.node as _al; _al.create_selected_solve_item(nuke.thisNode())",
         startline=False,
-        tooltip=(
-            "Create only the selected solved asset. Individual guided surfaces "
-            "are created as separate ReadGeo nodes."
-        ),
+        tooltip=_KNOB_TOOLTIPS["autolens_create_selected"],
     )
     node.addKnob(create_button)
 
@@ -597,7 +659,32 @@ def _add_knobs(node, source_read=None):
         pass
     node.addKnob(mask_invert)
 
+    # Options most artists never change live on the Advanced tab. The Solve
+    # panel mirrors them, so moving them doesn't change behaviour.
     node.addKnob(nuke.Tab_Knob("autolens_advanced_tab", "AutoLens Advanced"))
+
+    mode = nuke.Enumeration_Knob(
+        "autolens_run_mode", "Run mode",
+        ["Resume / reuse cached stages", "Rebuild dense only", "Rebuild everything"]
+    )
+    node.addKnob(mode)
+
+    use_guides = nuke.Boolean_Knob("autolens_use_guides", "Use surface guides")
+    use_guides.setValue(True)
+    try:
+        use_guides.setFlag(nuke.STARTLINE)
+    except Exception:
+        pass
+    node.addKnob(use_guides)
+
+    auto_import = nuke.Boolean_Knob("autolens_auto_import", "Create All when the solve completes")
+    auto_import.setValue(True)
+    try:
+        auto_import.setFlag(nuke.STARTLINE)
+    except Exception:
+        pass
+    node.addKnob(auto_import)
+
     python_k = nuke.String_Knob("autolens_python", "External Python")
     python_k.setValue("python")
     node.addKnob(python_k)
@@ -611,9 +698,13 @@ def _add_knobs(node, source_read=None):
     help_k = nuke.Text_Knob(
         "autolens_help", "",
         "Connect AutoLens directly after the plate (or an upstream chain containing the plate Read). "
-        "The image passes through unchanged. Open Setup / Run for surface guides and solving, or use Import Result when a completed track already exists."
+        "The image passes through unchanged.<br>"
+        "1. Open AutoLens... and click Solve.  2. Click Create All for the camera, lens and geometry.<br>"
+        "Surfaces and a tracking mask (input 1) are optional."
     )
     node.addKnob(help_k)
+
+    _apply_knob_help(node)
 
 
 def create_autolens_node():
@@ -1087,6 +1178,7 @@ def ensure_runtime_knobs(node):
 
     _ensure_source_input_label(node)
     _install_knob_changed_callback(node)
+    _apply_knob_help(node)
 
     # v0.10.5: absorb the old visible root-level surface-guide Roto into the
     # AutoLens Group so the user sees a single controller node.
@@ -1409,10 +1501,7 @@ def _refresh_create_item_knob(
                 "Create",
                 "import autolens.node as _al; _al.create_selected_solve_item(nuke.thisNode())",
                 startline=False,
-                tooltip=(
-                    "Create only the selected solved asset. Individual guided "
-                    "surfaces are created as separate ReadGeo nodes."
-                ),
+                tooltip=_KNOB_TOOLTIPS["autolens_create_selected"],
             )
             node.addKnob(button)
         except Exception:
@@ -1547,7 +1636,8 @@ def create_selected_solve_item(node):
     result_nk = result_path_for_node(node)
     if not result_nk:
         nuke.message(
-            "No completed AutoLens result was found in the selected output folder."
+            "No finished AutoLens solve was found in the selected solve version.\n\n"
+            "What to do: Solve first, or pick a Solve version that already holds a solve."
         )
         return None
 
@@ -1692,6 +1782,7 @@ def refresh_result_status(node):
         if status_knob is not None:
             status_knob.setValue(
                 '<font color="#63d471"><b>✓ Completed Result Available</b></font>'
+                '<br><font color="#9a9a9a">Next: click Create All.</font>'
             )
         try:
             node["autolens_result_nk"].setValue(str(result))
@@ -1713,6 +1804,7 @@ def refresh_result_status(node):
         if status_knob is not None:
             status_knob.setValue(
                 '<font color="#888888">○ No completed result in this folder</font>'
+                '<br><font color="#9a9a9a">Next: click Open AutoLens... and Solve.</font>'
             )
         try:
             node["autolens_result_nk"].setValue("")
@@ -1976,8 +2068,9 @@ def import_result_for_node(node):
 
     if not path:
         nuke.message(
-            "No completed AutoLens result was found.\n\n"
-            "Run AutoLens first, or point Output Folder at an existing solve."
+            "No finished AutoLens solve was found in the selected solve version.\n\n"
+            "What to do: click Open AutoLens... and Solve, or pick another Solve "
+            "version / Output root that already holds a solve."
         )
         return []
 

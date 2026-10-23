@@ -1,5 +1,11 @@
 # Troubleshooting
 
+## A solve failed
+When a solve fails, the Solve tab names the problem and says what to do next, for
+example *The camera could not be solved* or *Ran out of GPU or system memory*. The
+engine's own error line appears under *Engine message*, and the full COLMAP output
+is still in the log. Run mode Resume reuses every stage that already finished.
+
 ## Managed COLMAP shows CUDA BA warning
 If COLMAP reports Ceres was compiled without cuDSS, bundle adjustment may fall back to CPU. This does not necessarily indicate failure.
 
@@ -8,7 +14,7 @@ Verify:
 - selected solve version
 - output root
 - cached folder exists
-- Run Mode = Resume / reuse cached stages
+- Run Mode = Resume / reuse cached stages (under Advanced on the Solve tab)
 
 ## Guided surface floats in front of scene
 Possible causes:
