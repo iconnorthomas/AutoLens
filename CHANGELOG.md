@@ -10,11 +10,18 @@
   next/last, Loop and an fps box (defaults to the script's fps). Playback stays in real time and
   skips frames that aren't ready. Keys: Space play/pause, ←/→ or ,/. step (Shift = 10 frames),
   Home/End. A green bar under the timeline shows cached frames.
-- **EXR, DPX and other formats Qt can't read** are rendered by Nuke once into a 2K JPEG proxy
-  sequence in the temp folder, keyed by the Read's path and file date, instead of one temporary
-  PNG per frame change. **Cache** renders the missing proxies in one pass and decodes the whole
-  range; **Clear** forgets them (use it after changing nodes between the Read and AutoLens).
-  Proxy folders unused for 7 days are deleted.
+- **The plate loads like Match: no progress window, nothing blocks.** Opening the workspace
+  renders nothing. Plain JPEG/PNG/TIFF Reads are shown straight from their files. Anything else
+  (EXR, DPX, movies, nodes between the Read and AutoLens) is rendered by Nuke in idle time, a few
+  frames every 15 ms within a 60 ms budget, nearest the playhead first; the timeline's cache line
+  grows and a quiet "Caching plate n / total" hint shows progress. A frame that isn't cached yet
+  shows the nearest one until it's ready. Idle caching pauses while a solve runs or Nuke shows a
+  modal window, replacing the per-frame temporary PNG render.
+- **The plate cache persists** in `%LOCALAPPDATA%\AutoLens\cache` (`~/.cache/autolens` on
+  Linux, `~/Library/Caches/AutoLens` on macOS; set `AUTOLENS_CACHE_DIR` to move it), is never
+  deleted automatically, and is keyed by the upstream graph: a frame re-renders only when a
+  node's settings, the Root colour settings or that frame's source file change, so reopening a
+  shot renders nothing. **Clear** re-caches the shot by hand.
 - Zoom and pan are kept while stepping or playing; zooming in on a JPEG/PNG plate loads the
   settled frame at full resolution.
 - Fix: the workspace's keyboard shortcuts used `QtGui.QShortcut`, which only exists in Qt 6;

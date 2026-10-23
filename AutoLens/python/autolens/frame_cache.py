@@ -1,16 +1,14 @@
-"""Frame cache, prefetch ordering and playback timing for the workspace viewer.
+"""Memory cache, prefetch ordering and playback timing for the workspace viewer.
 
 Everything here is plain Python (no Qt, no Nuke) so the unit tests can cover it.
-autolens/preview_loader.py does the Qt decoding and dialog.py the Nuke rendering.
+autolens/preview_loader.py decodes frames with Qt; autolens/plate_cache.py keeps
+the persistent on-disk plate cache that Nuke fills in idle time.
 """
 from __future__ import annotations
 
 import bisect
-import hashlib
 import math
 import os
-import re
-import shutil
 import time
 from collections import OrderedDict
 
@@ -21,9 +19,6 @@ CACHE_MB_ENV = "AUTOLENS_PREVIEW_CACHE_MB"
 # doesn't throw the whole cache away.
 WIDTH_BUCKETS = (480, 640, 960, 1280, 1600, 1920, 2560, 3200, 3840)
 
-_PRINTF_RE = re.compile(r"%(0?)(\d*)d")
-_HASH_RE = re.compile(r"#+")
-_AT_RE = re.compile(r"@+")
 
 
 def cache_budget_bytes(environ=None):
@@ -223,29 +218,6 @@ def contiguous_runs(frames):
     return [(a, b) for a, b in runs]
 
 
-def split_runs(runs, max_len):
-    """Split (start, end) runs so none is longer than max_len frames."""
-    max_len = max(1, int(max_len))
-    out = []
-    for start, end in runs:
-        while start <= end:
-            stop = min(end, start + max_len - 1)
-            out.append((start, stop))
-            start = stop + 1
-    return out
-
-
-def merge_runs(runs, max_gap):
-    """Join sorted (start, end) runs separated by at most max_gap frames."""
-    merged = []
-    for start, end in runs:
-        if merged and start - merged[-1][1] - 1 <= max_gap:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return [(a, b) for a, b in merged]
-
-
 class PlaybackClock:
     """Real-time playback: which frame should be on screen now.
 
@@ -286,73 +258,3 @@ class PlaybackClock:
         if raw < self.first:
             return self.first, True
         return raw, False
-
-
-def expand_frame_pattern(pattern, frame):
-    """Replace %04d / #### / @@@ frame tokens in a sequence path."""
-    frame = int(frame)
-
-    def printf(match):
-        width = int(match.group(2) or 0)
-        if match.group(1) or width:
-            return "%0*d" % (width, frame)
-        return "%d" % frame
-
-    def padded(match):
-        return "%0*d" % (len(match.group(0)), frame)
-
-    out = _PRINTF_RE.sub(printf, pattern)
-    out = _HASH_RE.sub(padded, out)
-    out = _AT_RE.sub(padded, out)
-    return out
-
-
-def has_frame_token(pattern):
-    return bool(
-        _PRINTF_RE.search(pattern)
-        or _HASH_RE.search(pattern)
-        or _AT_RE.search(pattern)
-    )
-
-
-def is_directly_readable(path, supported_extensions):
-    """True when the file extension is one Qt can decode itself."""
-    ext = os.path.splitext(str(path))[1].lower().lstrip(".")
-    return bool(ext) and ext in {str(e).lower().lstrip(".") for e in supported_extensions}
-
-
-def proxy_key(*parts):
-    """Stable short folder name for a proxy sequence (path, mtime, size...)."""
-    text = "\n".join(str(p) for p in parts)
-    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]
-
-
-def proxy_frame_name(frame):
-    return "proxy.%06d.jpg" % int(frame)
-
-
-def prune_old_dirs(root, max_age_days=7.0, now=None, keep=()):
-    """Delete proxy folders under root not touched for max_age_days.
-
-    Returns the removed folder names. Errors are ignored.
-    """
-    removed = []
-    now = time.time() if now is None else now
-    try:
-        names = os.listdir(root)
-    except OSError:
-        return removed
-    for name in names:
-        if name in keep:
-            continue
-        path = os.path.join(root, name)
-        try:
-            if not os.path.isdir(path):
-                continue
-            if now - os.path.getmtime(path) < max_age_days * 86400.0:
-                continue
-            shutil.rmtree(path, ignore_errors=True)
-            removed.append(name)
-        except OSError:
-            pass
-    return removed

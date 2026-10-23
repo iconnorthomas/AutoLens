@@ -1,8 +1,6 @@
 """autolens.frame_cache: viewer cache, prefetch order and playback timing (no Qt, no Nuke)."""
 import os
 import sys
-import tempfile
-import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "AutoLens", "python"))
@@ -129,16 +127,6 @@ class FrameStepTests(unittest.TestCase):
             fc.contiguous_runs([5, 3, 4, 9, 10, 12, 4]),
             [(3, 5), (9, 10), (12, 12)],
         )
-        self.assertEqual(
-            fc.merge_runs([(1, 5), (7, 10), (30, 31)], 1),
-            [(1, 10), (30, 31)],
-        )
-        self.assertEqual(fc.merge_runs([(1, 5), (7, 10)], 0), [(1, 5), (7, 10)])
-        self.assertEqual(fc.merge_runs([(1, 2), (3, 4)], 0), [(1, 4)])
-        self.assertEqual(
-            fc.split_runs([(1, 10), (20, 21)], 4),
-            [(1, 4), (5, 8), (9, 10), (20, 21)],
-        )
 
 
 class PlaybackClockTests(unittest.TestCase):
@@ -178,47 +166,6 @@ class PlaybackClockTests(unittest.TestCase):
         self.assertEqual(clock.target(), (8, False))
         now[0] += 5
         self.assertEqual(clock.target(), (1, True))
-
-
-class PathTests(unittest.TestCase):
-    def test_expand_frame_pattern(self):
-        self.assertEqual(fc.expand_frame_pattern("/a/plate.%04d.jpg", 7), "/a/plate.0007.jpg")
-        self.assertEqual(fc.expand_frame_pattern("/a/plate.%d.jpg", 7), "/a/plate.7.jpg")
-        self.assertEqual(fc.expand_frame_pattern("/a/plate.####.png", 1001), "/a/plate.1001.png")
-        self.assertEqual(fc.expand_frame_pattern("/a/plate.@@@.png", 5), "/a/plate.005.png")
-        self.assertEqual(fc.expand_frame_pattern("/a/plate.%04d.jpg", -3), "/a/plate.-003.jpg")
-        self.assertEqual(fc.expand_frame_pattern("/a/still.jpg", 5), "/a/still.jpg")
-        self.assertTrue(fc.has_frame_token("x.%04d.exr"))
-        self.assertTrue(fc.has_frame_token("x.####.exr"))
-        self.assertFalse(fc.has_frame_token("x.exr"))
-
-    def test_is_directly_readable(self):
-        formats = {"jpg", "jpeg", "png", "tif"}
-        self.assertTrue(fc.is_directly_readable("/a/b.0001.JPG", formats))
-        self.assertTrue(fc.is_directly_readable("C:\\a\\b.png", formats))
-        self.assertFalse(fc.is_directly_readable("/a/b.0001.exr", formats))
-        self.assertFalse(fc.is_directly_readable("/a/noext", formats))
-
-    def test_proxy_names(self):
-        key = fc.proxy_key("/a/plate.%04d.exr", (1, 2), 0.5)
-        self.assertEqual(key, fc.proxy_key("/a/plate.%04d.exr", (1, 2), 0.5))
-        self.assertNotEqual(key, fc.proxy_key("/a/plate.%04d.exr", (1, 3), 0.5))
-        self.assertEqual(len(key), 16)
-        # Must match what Nuke writes for "proxy.%06d.jpg".
-        self.assertEqual(fc.proxy_frame_name(12), "proxy.000012.jpg")
-        self.assertEqual(fc.proxy_frame_name(-1), "proxy.-00001.jpg")
-
-    def test_prune_old_dirs(self):
-        with tempfile.TemporaryDirectory() as root:
-            for name in ("old", "new", "kept"):
-                os.mkdir(os.path.join(root, name))
-            old_time = time.time() - 10 * 86400
-            os.utime(os.path.join(root, "old"), (old_time, old_time))
-            os.utime(os.path.join(root, "kept"), (old_time, old_time))
-            removed = fc.prune_old_dirs(root, 7.0, keep={"kept"})
-            self.assertEqual(removed, ["old"])
-            self.assertEqual(sorted(os.listdir(root)), ["kept", "new"])
-        self.assertEqual(fc.prune_old_dirs(os.path.join(root, "gone")), [])
 
 
 if __name__ == "__main__":

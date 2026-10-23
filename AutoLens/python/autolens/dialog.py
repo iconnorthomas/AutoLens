@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
 import time
 from pathlib import Path
 import re
@@ -18,22 +16,17 @@ except ImportError:
 
 from . import __version__
 from .frame_cache import (
-    CACHE_MB_ENV,
     PlaybackClock,
     bucket_width,
     cache_budget_bytes,
     clamp_frame,
     contiguous_runs,
-    expand_frame_pattern,
-    is_directly_readable,
-    merge_runs,
     nearest_cached,
     prefetch_order,
-    prune_old_dirs,
-    proxy_frame_name,
-    proxy_key,
     step_frame,
 )
+from .plate_cache import PlateCacheManager, default_cache_root
+from .plate_source import NukePlateSource
 from .preview_loader import PreviewLoader, supported_extensions
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
@@ -57,8 +50,14 @@ from .tracking_masks import (
 
 _DIALOGS = {}
 
-# Nuke-rendered preview proxies (EXR, DPX...) are capped at this width.
-PROXY_MAX_WIDTH = 2048.0
+# Viewer frames Nuke renders (EXR, DPX, graded plates...) are capped at this
+# long edge. Idle caching renders for up to CACHE_STEP_SECONDS every
+# CACHE_TICK_MS on the main thread (Nuke renders must run there), nearest the
+# playhead first, so the workspace never blocks or shows a progress window.
+PROXY_MAX_WIDTH = 2048
+CACHE_TICK_MS = 15
+CACHE_STEP_SECONDS = 0.06
+CACHE_REFRESH_SECONDS = 2.0
 
 LEFT_BUTTON = getattr(
     QtCore.Qt,
@@ -1944,8 +1943,14 @@ class AutoLensDialog(QtWidgets.QDialog):
             )
 
         self._setup_preview_source(read, force=True)
+        decode_failed = False
+        if self._preview_path_for_frame(frame):
+            # One file decode (never a render) so the plate is there at once.
+            decode_failed = self._preview.load_now(frame) is None
         self._show_frame(frame, settle=False)
         self._settle_frame(frame, refresh_surfaces=False)
+        if decode_failed:
+            self._preview_frame_failed(frame)
 
         if frame_info["clamped"] and self._view_exact:
             self.workspace_status.setText(
@@ -1964,10 +1969,11 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._displayed_frame = None
         self._preview_mode = None          # "direct", "render" or None
         self._preview_info = {}
-        self._preview_signature = None
         self._preview_force_render = False
-        self._proxy_frames = set()
-        self._proxies_pruned = False
+        self._plate_cache = None           # plate_cache.PlateCacheManager
+        self._cache_refresh_time = 0.0
+        self._cache_stepping = False
+        self._cache_failures_reported = 0
         self._play_clock = None
         self._play_shown = 0
         self._play_held = 0
@@ -1993,6 +1999,10 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._settle_timer.timeout.connect(
             lambda: self._settle_frame(self._view_frame)
         )
+
+        self._cache_timer = QtCore.QTimer(self)
+        self._cache_timer.setInterval(CACHE_TICK_MS)
+        self._cache_timer.timeout.connect(self._cache_tick)
 
         self._sharp_timer = QtCore.QTimer(self)
         self._sharp_timer.setSingleShot(True)
@@ -2054,17 +2064,9 @@ class AutoLensDialog(QtWidgets.QDialog):
         bar.addWidget(self.cache_label)
 
         button(
-            "Cache",
-            "Decode the whole range into memory for smooth playback. "
-            "EXR/DPX and other formats Qt can't read are first rendered "
-            "once to a JPEG proxy sequence in the temp folder.",
-            self._cache_all_frames,
-            width=64,
-        )
-        button(
             "Clear",
-            "Forget cached frames and delete this shot's proxy files "
-            "(use after changing nodes upstream of AutoLens).",
+            "Re-cache this shot's frames. Rarely needed: frames re-render "
+            "by themselves when the plate or the nodes above AutoLens change.",
             self._clear_frame_cache,
             width=52,
         )
@@ -2127,26 +2129,6 @@ class AutoLensDialog(QtWidgets.QDialog):
         super().keyPressEvent(event)
 
     # Source -----------------------------------------------------------
-    def _read_signature(self, read):
-        """Everything that changes which pixels the Read delivers."""
-        parts = []
-        try:
-            parts.append(read.fullName())
-            parts.append(nuke.filename(read) or "")
-            for name in (
-                "file", "proxy", "first", "last", "frame_mode", "frame",
-                "colorspace", "raw", "premultiplied",
-            ):
-                knob = read.knob(name)
-                parts.append(knob.value() if knob is not None else None)
-            parts.append((int(read.width()), int(read.height())))
-            upstream = self.controller_node.input(0)
-            parts.append(upstream.fullName() if upstream is not None else "")
-        except Exception:
-            pass
-        parts.append(self._preview_force_render)
-        return tuple(str(p) for p in parts)
-
     def _viewer_decode_width(self):
         try:
             ratio = float(self.canvas.devicePixelRatioF())
@@ -2154,44 +2136,41 @@ class AutoLensDialog(QtWidgets.QDialog):
             ratio = 1.0
         return bucket_width(max(320, self.canvas.width()) * ratio)
 
-    def _evaluated_filename(self, read, frame):
-        """The Read's file for one frame, evaluated by Nuke (main thread)."""
-        old_frame = int(nuke.frame())
+    def _plate_node(self, read):
+        """What the viewer shows: AutoLens's input 0 (the Read if unconnected)."""
         try:
-            if old_frame != int(frame):
-                nuke.frame(int(frame))
-            try:
-                return nuke.filename(read, nuke.REPLACE) or read["file"].evaluate()
-            except Exception:
-                return read["file"].evaluate()
+            node = self.controller_node.input(0)
         except Exception:
-            return ""
-        finally:
-            if int(nuke.frame()) != old_frame:
-                nuke.frame(old_frame)
+            node = None
+        return node or read
+
+    @staticmethod
+    def _node_id(node):
+        try:
+            return node.fullName()
+        except Exception:
+            return id(node)
 
     def _setup_preview_source(self, read, force=False):
-        """Pick how frames are loaded and point the cache at them.
+        """Point the viewer at this shot's plate cache. Renders nothing.
 
-        direct: Qt reads the Read's files itself (JPEG/PNG/TIFF...), decoded on
-                worker threads, any frame, at any time.
-        render: formats Qt can't read (EXR, DPX, movies) are rendered by Nuke
-                once into a JPEG proxy sequence keyed by path, mtime and size;
-                the proxies are then decoded like a direct sequence.
+        Plain JPEG/PNG/TIFF Reads are shown from their own files ("direct").
+        Anything else (EXR, DPX, movies, nodes between the Read and AutoLens)
+        is rendered by Nuke in idle time into a persistent cache keyed by the
+        upstream graph, so frames rendered once are reused next time.
         """
-        signature = self._read_signature(read)
-        max_w = self._viewer_decode_width()
-        if not force and signature == self._preview_signature and self._preview_mode:
-            # Same plate; only a bigger viewer needs a fresh cache.
-            self._preview.set_source(
-                self._preview.source,
-                self._preview_path_for_frame,
-                max_w,
-                self._preview_info.get("pa", 1.0),
+        if self._cache_stepping:
+            return          # a render is pumping events; try again next settle
+        plate = self._plate_node(read)
+        frame_range = source_frame_range(read)
+        if frame_range:
+            first, last = frame_range
+        else:
+            first = last = (
+                self._view_frame if self._view_frame is not None
+                else int(nuke.frame())
             )
-            return
-
-        self._preview_signature = signature
+        frames = list(range(int(first), int(last) + 1))
         width = max(1, int(read.width()))
         height = max(1, int(read.height()))
         try:
@@ -2200,177 +2179,138 @@ class AutoLensDialog(QtWidgets.QDialog):
             pa = 1.0
         pa = pa if pa > 0 else 1.0
 
-        frame = self._view_frame
-        if frame is None:
-            frame = int(nuke.frame())
-        try:
-            pattern = nuke.filename(read) or ""
-        except Exception:
-            pattern = ""
-        evaluated = self._evaluated_filename(read, frame)
-
-        frame_knob = read.knob("frame")
-        remapped = bool(
-            frame_knob is not None and str(frame_knob.value()).strip()
-        )
-        direct = False
+        mgr = self._plate_cache
         if (
-            pattern
-            and evaluated
-            and not remapped
-            and not self._preview_force_render
-            and is_directly_readable(evaluated, self._qt_formats)
+            mgr is not None
+            and not force
+            and self._node_id(mgr.source.plate_node) == self._node_id(plate)
+            and mgr.frames == frames
         ):
-            # Only trust our own frame substitution if it reproduces Nuke's
-            # file name for this frame; anything cleverer goes through Nuke.
-            expanded = expand_frame_pattern(pattern, frame)
-            direct = os.path.normcase(os.path.normpath(expanded)) == (
-                os.path.normcase(os.path.normpath(evaluated))
-            )
-
-        info = {"width": width, "height": height, "pa": pa}
-        if direct:
-            info["pattern"] = pattern
-            self._preview_mode = "direct"
-            self._proxy_frames = set()
-            source = ("direct", pattern, width, height)
+            self._refresh_plate_cache()
         else:
-            # Proxies hold display pixels, so cap them at 2K: plenty for a
-            # guide editor, and quick to write and decode.
-            scale = min(1.0, PROXY_MAX_WIDTH / float(width))
+            self._cache_timer.stop()
             try:
-                stat = os.stat(evaluated)
-                stamp = (int(stat.st_mtime), int(stat.st_size))
-            except Exception:
-                stamp = None
-            key = proxy_key(*(signature + (stamp, round(scale, 4))))
-            root = os.path.join(tempfile.gettempdir(), "autolens_proxies")
-            info["proxy_dir"] = os.path.join(root, key)
-            info["proxy_scale"] = scale
-            if not self._proxies_pruned:
-                self._proxies_pruned = True
-                prune_old_dirs(root, 7.0, keep={key})
-            self._preview_mode = "render"
-            self._proxy_frames = self._scan_proxies(info["proxy_dir"])
-            source = ("render", key, width, height)
+                source = NukePlateSource(
+                    plate,
+                    frames,
+                    width,
+                    height,
+                    max_size=PROXY_MAX_WIDTH,
+                    readable_exts=(
+                        () if self._preview_force_render else self._qt_formats
+                    ),
+                    nuke=nuke,
+                )
+                mgr = PlateCacheManager(source, cache_root=default_cache_root())
+            except Exception as exc:
+                self._plate_cache = None
+                self._preview_mode = None
+                self.workspace_status.setText(f"Plate cache unavailable: {exc}")
+                return
+            self._plate_cache = mgr
+            self._cache_refresh_time = time.monotonic()
+            self._cache_failures_reported = 0
 
-        self._preview_info = info
-        self._preview.set_source(source, self._preview_path_for_frame, max_w, pa)
+        self._preview_info = {"width": width, "height": height, "pa": pa}
+        self._preview_mode = "direct" if mgr.direct else "render"
+        self._preview.set_source(
+            (mgr.directory, self._preview_mode, width, height),
+            self._preview_path_for_frame,
+            self._viewer_decode_width(),
+            pa,
+        )
         self._update_cache_bar()
+        if not mgr.done:
+            self._cache_timer.start()
+
+    def _refresh_plate_cache(self, force=False):
+        """Re-check the upstream graph and files (throttled); stale frames re-render."""
+        mgr = self._plate_cache
+        if mgr is None or self._cache_stepping:
+            return
+        now = time.monotonic()
+        if not force and now - self._cache_refresh_time < CACHE_REFRESH_SECONDS:
+            return
+        self._cache_refresh_time = now
+        try:
+            stale = mgr.refresh()
+        except Exception as exc:
+            self.workspace_status.setText(f"Plate cache check failed: {exc}")
+            return
+        if stale:
+            self._preview.forget(stale)
+            if self._preview.full is not None and self._preview.full[0] in stale:
+                self._preview.full = None
+        if not mgr.done:
+            self._cache_timer.start()
+
+    def _cache_busy(self):
+        """Hold idle caching while it would get in the way."""
+        if self._cache_stepping or not self.isVisible() or self.isMinimized():
+            return True
+        if self.timeline.scrubbing:
+            return True
+        runner = getattr(getattr(self, "panel", None), "runner", None)
+        try:
+            if runner is not None and runner.is_running():
+                return True     # a solve is starting or running
+        except Exception:
+            pass
+        # Nuke's own progress bars and message boxes are modal.
+        modal = QtWidgets.QApplication.activeModalWidget()
+        return modal is not None and modal is not self
+
+    def _cache_tick(self):
+        """Idle time: render a few plate frames nearest the playhead.
+
+        Runs on the main thread because nuke.execute must. Each tick renders
+        at least one frame and stops when the time budget is spent, so the
+        viewer keeps responding; the timeline's cache line grows as it goes.
+        """
+        mgr = self._plate_cache
+        if mgr is None or mgr.done:
+            self._cache_timer.stop()
+            self._update_cache_bar()
+            self._report_cache_failures()
+            return
+        if self._cache_busy():
+            return
+        self._cache_stepping = True
+        try:
+            got = mgr.step(CACHE_STEP_SECONDS)
+        except Exception as exc:
+            self._cache_timer.stop()
+            self.workspace_status.setText(f"Plate caching stopped: {exc}")
+            return
+        finally:
+            self._cache_stepping = False
+        if got:
+            self._preview.forget(got)
+            if not self._playing() and self._view_frame is not None:
+                self._request_around(self._view_frame, 0)
+            self._update_cache_bar()
+
+    def _report_cache_failures(self):
+        mgr = self._plate_cache
+        if mgr is None or len(mgr.failed) <= self._cache_failures_reported:
+            return
+        self._cache_failures_reported = len(mgr.failed)
+        frame, error = sorted(mgr.failed.items())[0]
+        self.workspace_status.setText(
+            f"{len(mgr.failed)} plate frame(s) failed to cache, e.g. frame {frame}: {error}"
+        )
 
     def _preview_path_for_frame(self, frame):
-        info = self._preview_info
-        if self._preview_mode == "direct":
-            return expand_frame_pattern(info["pattern"], frame)
-        if self._preview_mode == "render" and frame in self._proxy_frames:
-            return os.path.join(info["proxy_dir"], proxy_frame_name(frame))
-        return None
-
-    def _scan_proxies(self, folder):
-        frames = set()
-        try:
-            names = os.listdir(folder)
-        except OSError:
-            return frames
-        for name in names:
-            match = re.match(r"^proxy\.(-?\d+)\.jpg$", name)
-            if match:
-                frames.add(int(match.group(1)))
-        return frames
-
-    def _render_proxies(self, frames, max_gap=0):
-        """Render JPEG proxies for these frames with one Write (main thread).
-
-        Contiguous frames go through a single nuke.execute, which shows Nuke's
-        own progress bar and can be cancelled. Runs separated by up to max_gap
-        already-rendered frames are merged, re-rendering the gap, so a whole
-        range takes one progress bar rather than one per gap.
-        """
-        info = self._preview_info
-        if self._preview_mode != "render" or not frames:
-            return
-        frame_range = source_frame_range(self.read_node)
-        if frame_range:
-            frames = [
-                f for f in frames
-                if frame_range[0] <= f <= frame_range[1]
-            ]
-        frames = sorted(set(frames) - self._proxy_frames)
-        if not frames:
-            return
-
-        folder = info["proxy_dir"]
-        try:
-            os.makedirs(folder, exist_ok=True)
-        except OSError as exc:
-            self.workspace_status.setText(f"Proxy folder failed: {exc}")
-            return
-
-        runs = merge_runs(contiguous_runs(frames), max_gap)
-        # Proxies in a merged gap get rewritten: drop their decodes too.
-        rendered = [f for start, end in runs for f in range(start, end + 1)]
-        self._preview.cancel_all()
-        created = []
-        undo = getattr(nuke, "Undo", None)
-        try:
-            if undo is not None:
-                undo.disable()
-        except Exception:
-            undo = None
-        try:
-            source = self.controller_node.input(0) or self.read_node
-            scale = float(info.get("proxy_scale", 1.0))
-            if scale < 0.999:
-                try:
-                    reformat = nuke.nodes.Reformat()
-                    created.append(reformat)
-                    reformat.setInput(0, source)
-                    reformat["type"].setValue("scale")
-                    reformat["scale"].setValue(scale)
-                    source = reformat
-                except Exception:
-                    pass        # full-size proxies still work
-
-            write = nuke.nodes.Write()
-            created.append(write)
-            write.setInput(0, source)
-            write["file"].setValue(
-                folder.replace("\\", "/") + "/proxy.%06d.jpg"
-            )
-            if write.knob("file_type"):
-                write["file_type"].setValue("jpeg")
-            if write.knob("_jpeg_quality"):
-                write["_jpeg_quality"].setValue(0.9)
-            if write.knob("channels"):
-                write["channels"].setValue("rgb")
-
-            for start, end in runs:
-                nuke.execute(write.name(), int(start), int(end), 1)
-        except Exception as exc:
-            # Includes the user cancelling Nuke's progress bar.
-            self.workspace_status.setText(f"Proxy render stopped: {exc}")
-        finally:
-            for node in reversed(created):
-                try:
-                    nuke.delete(node)
-                except Exception:
-                    pass
-            if undo is not None:
-                try:
-                    undo.enable()
-                except Exception:
-                    pass
-            self._proxy_frames = self._scan_proxies(folder)
-            self._preview.forget(rendered)
-            self._update_cache_bar()
+        mgr = self._plate_cache
+        return mgr.path(frame) if mgr is not None else None
 
     # Frames -----------------------------------------------------------
     def _show_frame(self, frame, settle=False, direction=0, playing=False):
         """Put `frame` on screen as fast as possible.
 
-        Cached: shown now. Not cached: the nearest cached frame stands in
-        (held while playing) and the exact frame is decoded in the
-        background; settling then fills in anything still missing.
+        Decoded: shown now. Otherwise the nearest decoded frame stands in
+        (held while playing) and the exact frame is swapped in when it has
+        been decoded, or rendered by idle caching. Never renders here.
         """
         frame = clamp_frame(
             frame,
@@ -2381,6 +2321,11 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.timeline.set_current_frame(frame)
         self.canvas.set_current_frame(frame)
         self._preview.protect = {frame}
+        if self._plate_cache is not None:
+            # Idle caching works outward from here.
+            self._plate_cache.request(frame)
+            if not self._plate_cache.done and not self._cache_timer.isActive():
+                self._cache_timer.start()
 
         pixmap = self._preview.pixmap(frame)
         if pixmap is not None:
@@ -2451,7 +2396,11 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._preview.request(order)
 
     def _settle_frame(self, frame, refresh_surfaces=True):
-        """Bring Nuke and the rest of the workspace onto the shown frame."""
+        """Bring Nuke and the rest of the workspace onto the shown frame.
+
+        Never renders: a frame that isn't cached yet is rendered next by idle
+        caching and swapped in when it's ready.
+        """
         self._settle_timer.stop()
         if frame is None or self._playing():
             return
@@ -2466,14 +2415,14 @@ class AutoLensDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        if self.read_node is not None and self._preview_mode:
-            self._setup_preview_source(self.read_node)
-        elif self.read_node is None:
+        if self.read_node is None:
             # A Read may have been connected since the dialog opened.
             read = source_read_for_node(self.controller_node)
             if read is not None:
                 self.read_node = read
                 self._setup_preview_source(read, force=True)
+        else:
+            self._setup_preview_source(self.read_node)
 
         if refresh_surfaces:
             self._reload_surfaces()
@@ -2481,23 +2430,10 @@ class AutoLensDialog(QtWidgets.QDialog):
                 self._refresh_mask_preview()
 
         pixmap = self._preview.pixmap(frame)
-        if pixmap is None and self._preview_mode == "render":
-            self.workspace_status.setText(f"Rendering preview of frame {frame}…")
-            self.workspace_status.repaint()
-            self._render_proxies([frame])
-            pixmap = self._preview.load_now(frame)
-        elif pixmap is None and self._preview_mode == "direct":
-            # Usually already decoding; finish this one frame here so the
-            # settled frame is always the exact one.
-            pixmap = self._preview.load_now(frame)
-            if pixmap is None:
-                self._preview_frame_failed(frame)
-                return
-
         if pixmap is not None:
             self._display_pixmap(pixmap, frame)
-            self._request_around(frame, 0)
             self._sharp_timer.start()
+        self._request_around(frame, 0)
         self._update_cache_bar()
         self._update_frame_status()
 
@@ -2505,17 +2441,24 @@ class AutoLensDialog(QtWidgets.QDialog):
         info = self._preview_info
         if not self._preview_mode:
             return
+        frame = self._view_frame
+        mgr = self._plate_cache
         if not self._view_exact:
-            self.workspace_status.setText(
-                "Preview unavailable; surface data is still editable."
-            )
+            if mgr is not None and frame in mgr.failed:
+                text = f"Frame {frame} failed to cache: {mgr.failed[frame]}"
+            elif mgr is not None and mgr.path(frame) is None:
+                text = (
+                    f"Frame {frame} is still caching; the nearest cached "
+                    "frame is shown. Surface data is still editable."
+                )
+            else:
+                text = f"Loading frame {frame}…"
+            self.workspace_status.setText(text)
             return
-        source = (
-            "direct" if self._preview_mode == "direct" else "Nuke-rendered proxy"
-        )
+        source = "plate files" if self._preview_mode == "direct" else "cached render"
         self.workspace_status.setText(
-            f"Frame {self._view_frame} • {info['width']} × {info['height']} "
-            f"• PAR {info['pa']:g} • {source} preview"
+            f"Frame {frame} • {info['width']} × {info['height']} "
+            f"• PAR {info['pa']:g} • {source}"
         )
 
     def _request_sharp(self):
@@ -2551,19 +2494,23 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._update_cache_bar()
 
     def _preview_frame_failed(self, frame):
-        if self._preview_mode != "direct" or frame != self._view_frame:
+        mgr = self._plate_cache
+        if mgr is None or frame != self._view_frame:
             return
-        path = self._preview_path_for_frame(frame)
-        if path and os.path.isfile(path) and not self._preview_force_render:
+        path = mgr.path(frame)
+        if not path or not os.path.isfile(path):
+            return
+        if self._preview_mode == "direct" and not self._preview_force_render:
             # The file is there but this Qt can't decode it (float TIFF, odd
-            # PNG...): let Nuke render proxies for this plate instead.
+            # PNG...): let Nuke render this plate instead.
             self._preview_force_render = True
             QtCore.QTimer.singleShot(0, self._reload_preview_source)
-        elif not self._playing():
-            self.workspace_status.setText(
-                f"Frame {frame}: file missing ({path}); "
-                "surface data is still editable."
-            )
+        elif self._preview_mode == "render" and not self._cache_stepping:
+            # A damaged cache file: render it again.
+            mgr.invalidate([frame])
+            self._preview.forget([frame])
+            mgr.request(frame)
+            self._cache_timer.start()
 
     def _reload_preview_source(self):
         if self.read_node is None:
@@ -2573,16 +2520,18 @@ class AutoLensDialog(QtWidgets.QDialog):
 
     def _update_cache_bar(self):
         frames = self._preview.frames()
-        disk = self._proxy_frames if self._preview_mode == "render" else ()
+        mgr = self._plate_cache
+        disk = mgr.cached_frames() if mgr is not None else []
         self.timeline.set_cached_ranges(
             contiguous_runs(frames),
             contiguous_runs(disk),
         )
-        used = self._preview.cache.total_bytes / (1024.0 * 1024.0)
-        budget = self._preview.cache.max_bytes / (1024.0 * 1024.0)
-        text = f"{len(frames)} cached • {used:.0f}/{budget:.0f} MB"
-        if disk:
-            text = f"{len(disk)} proxies • " + text
+        if mgr is not None and not mgr.done:
+            # The quiet progress hint; caching never opens a window.
+            text = f"Caching plate {len(disk)} / {len(mgr.frames)}"
+        else:
+            used = self._preview.cache.total_bytes / (1024.0 * 1024.0)
+            text = f"{len(frames)} in memory • {used:.0f} MB"
         self.cache_label.setText(text)
 
     # Transport --------------------------------------------------------
@@ -2622,16 +2571,12 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._play_timer.start(max(1, int(500.0 / fps)))
         self._sync_play_buttons()
         self._show_frame(frame, direction=direction, playing=True)
-        if self._preview_mode == "render":
-            missing = (
-                self.timeline.last_frame - self.timeline.first_frame + 1
-                - len(self._proxy_frames)
+        mgr = self._plate_cache
+        if mgr is not None and not mgr.done:
+            self.workspace_status.setText(
+                f"Playing: {len(mgr.cached_frames())} of {len(mgr.frames)} frames "
+                "cached so far; the rest fill in while the plate caches."
             )
-            if missing > 0:
-                self.workspace_status.setText(
-                    f"Playing proxies only: {missing} frames not rendered yet. "
-                    "Click Cache to render them once."
-                )
 
     def _stop_playback(self, settle=True):
         if not self._playing():
@@ -2696,50 +2641,24 @@ class AutoLensDialog(QtWidgets.QDialog):
         frame = self.timeline.last_frame if which > 0 else self.timeline.first_frame
         self._show_frame(frame, settle=True)
 
-    def _cache_all_frames(self):
-        self._stop_playback()
-        if not self._preview_mode or self._view_frame is None:
-            return
-        first, last = self.timeline.first_frame, self.timeline.last_frame
-        if self._preview_mode == "render":
-            missing = [
-                f for f in range(first, last + 1)
-                if f not in self._proxy_frames
-            ]
-            if missing:
-                self.workspace_status.setText(
-                    f"Rendering {len(missing)} proxy frames…"
-                )
-                self.workspace_status.repaint()
-                self._render_proxies(missing, max_gap=12)
-        capacity = self._preview.capacity_frames(
-            self._preview_info["width"],
-            self._preview_info["height"],
-        )
-        order = [self._view_frame] + prefetch_order(
-            self._view_frame, first, last, 1,
-            ahead=last - first, behind=0, loop=True,
-        )
-        self._preview.request(order[:capacity])
-        span = last - first + 1
-        self.workspace_status.setText(
-            f"Caching {min(span, capacity)} of {span} frames in the background…"
-            + (
-                "" if capacity >= span
-                else f" (memory budget; set {CACHE_MB_ENV} to raise it)"
-            )
-        )
-
     def _clear_frame_cache(self):
+        if self._cache_stepping:
+            QtCore.QTimer.singleShot(50, self._clear_frame_cache)
+            return
         self._stop_playback(settle=False)
         self._preview.cancel_all()
         self._preview.cache.clear()
         self._preview.failed.clear()
         self._preview.full = None
-        folder = self._preview_info.get("proxy_dir")
-        if folder:
-            shutil.rmtree(folder, ignore_errors=True)
-            self._proxy_frames = set()
+        mgr = self._plate_cache
+        if mgr is not None:
+            # Rendered frames go stale and re-render in idle time, nearest
+            # first. Nothing is deleted; direct plate files are untouched.
+            mgr.invalidate()
+            if self._view_frame is not None:
+                mgr.request(self._view_frame)
+            if not mgr.done:
+                self._cache_timer.start()
         self._update_cache_bar()
         self._settle_frame(self._view_frame)
 
@@ -2748,6 +2667,7 @@ class AutoLensDialog(QtWidgets.QDialog):
             self._play_timer.stop()
             self._settle_timer.stop()
             self._sharp_timer.stop()
+            self._cache_timer.stop()
             self._preview.shutdown()
         except Exception:
             pass
