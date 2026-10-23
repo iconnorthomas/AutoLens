@@ -84,8 +84,40 @@ SUPPORTED_EXTENSIONS = {
 TOTAL_STEPS = 11
 
 
+GEOMETRY_STATUS_FILE = "autolens_geometry_status.json"
+_GEOMETRY_STATUS = {"path": None, "state": None}
+
+
+def write_geometry_status(output: Path, status: str, **extra) -> dict:
+    """
+    Record the dense-geometry state for the UI in <output>/autolens_geometry_status.json:
+    "none" (camera-only solve), "building" (with step/total/stage while the
+    engine runs), "ready" or "failed" (with "error"). Writes are atomic so a
+    poller never reads half a file.
+    """
+    payload = {"status": status, "updated_unix": round(time.time(), 3), "pid": os.getpid()}
+    payload.update(extra)
+    path = Path(output) / GEOMETRY_STATUS_FILE
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except OSError as exc:
+        print(f"[AUTOLENS] Could not write {path.name}: {exc}")
+    _GEOMETRY_STATUS["path"] = Path(output) if status == "building" else None
+    _GEOMETRY_STATUS["state"] = payload
+    return payload
+
+
 def show_progress(step: int, label: str, detail: str | None = None) -> None:
     """Print a conspicuous high-level AutoLens progress banner."""
+    if _GEOMETRY_STATUS["path"] is not None:
+        state = dict(_GEOMETRY_STATUS["state"] or {})
+        state.pop("status", None)
+        state.pop("updated_unix", None)
+        state.pop("pid", None)
+        state.update({"step": int(step), "total": TOTAL_STEPS, "stage": label})
+        write_geometry_status(_GEOMETRY_STATUS["path"], "building", **state)
     width = 30
     completed = int(round((step / TOTAL_STEPS) * width))
     bar = "#" * completed + "-" * (width - completed)
@@ -163,6 +195,57 @@ def _powershell_exe() -> str:
     return shutil.which("powershell.exe") or shutil.which("pwsh.exe") or "powershell.exe"
 
 
+def _env_flag(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def managed_colmap_executable(env_prefix, command: str = "colmap"):
+    """The COLMAP executable inside a conda env, or None if it isn't there."""
+    prefix = Path(env_prefix)
+    names = [command + ".exe", command] if os.name == "nt" else [command]
+    for folder in (prefix / "Library" / "bin", prefix / "bin", prefix / "Scripts", prefix):
+        for name in names:
+            candidate = folder / name
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def direct_colmap_environment(env_prefix, base_env) -> dict:
+    """
+    The environment `conda activate` would give COLMAP: the env's folders at
+    the front of PATH. Nuke's Qt and Python variables are dropped so they
+    can't leak into COLMAP's own Qt/Python libraries.
+    """
+    prefix = Path(env_prefix)
+    env = {
+        key: value
+        for key, value in dict(base_env).items()
+        if not key.upper().startswith("QT_")
+        and key.upper() not in ("PYTHONHOME", "PYTHONPATH", "QML2_IMPORT_PATH")
+    }
+    if os.name == "nt":
+        folders = [
+            prefix,
+            prefix / "Library" / "mingw-w64" / "bin",
+            prefix / "Library" / "usr" / "bin",
+            prefix / "Library" / "bin",
+            prefix / "Scripts",
+            prefix / "bin",
+        ]
+    else:
+        folders = [prefix / "bin"]
+    path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
+    env[path_key] = os.pathsep.join(
+        [str(p) for p in folders] + ([env[path_key]] if env.get(path_key) else [])
+    )
+    env["CONDA_PREFIX"] = str(prefix)
+    cacert = prefix / "Library" / "ssl" / "cacert.pem"
+    if cacert.is_file():
+        env.setdefault("SSL_CERT_FILE", str(cacert))
+    return env
+
+
 def prepare_colmap_command(cmd: list[str], cwd: Path | None = None):
     """
     Resolve AutoLens-managed COLMAP without any nested batch wrapper.
@@ -204,6 +287,17 @@ def prepare_colmap_command(cmd: list[str], cwd: Path | None = None):
             if not env_prefix or not Path(env_prefix).exists():
                 raise RuntimeError(
                     f"Managed COLMAP environment is missing: {env_prefix}"
+                )
+
+            # `conda run` costs ~2 s per call (measured on an RTX 3080 Ti
+            # workstation) and a solve makes 10+ calls. Launch the env's
+            # colmap.exe directly with the PATH that activation would set.
+            direct = managed_colmap_executable(env_prefix, command)
+            if direct is not None and not _env_flag("AUTOLENS_COLMAP_VIA_CONDA"):
+                return (
+                    [direct, *args],
+                    (str(cwd) if cwd else None),
+                    direct_colmap_environment(env_prefix, os.environ),
                 )
 
             argv = [
@@ -3376,10 +3470,26 @@ def build_guided_surfaces(
         )
         for p in points3d
     }
-    triangles = triangulate_faces(proxy_faces)
+    # Camera-first runs (--skip-dense) have no proxy mesh yet. Guides then fit
+    # to the sparse points alone, which is what they prefer anyway; the dense
+    # proxy only refines a fit, or fills in for guides with < 3 sparse points.
+    has_proxy = (
+        proxy_vertices is not None
+        and len(proxy_vertices) > 0
+        and proxy_faces is not None
+        and len(proxy_faces) > 0
+    )
+    if has_proxy:
+        triangles = triangulate_faces(proxy_faces)
+        extent_points = np.asarray(proxy_vertices, dtype=np.float64)
+    else:
+        proxy_vertices = np.zeros((0, 3), dtype=np.float64)
+        triangles = np.zeros((0, 3), dtype=np.int64)
+        extent_points = np.asarray([p["xyz"] for p in points3d], dtype=np.float64).reshape(-1, 3)
+        print("[AUTOLENS GUIDE] No dense proxy yet; fitting guides to sparse points only.")
 
-    low = np.percentile(proxy_vertices, 1.0, axis=0)
-    high = np.percentile(proxy_vertices, 99.0, axis=0)
+    low = np.percentile(extent_points, 1.0, axis=0)
+    high = np.percentile(extent_points, 99.0, axis=0)
     scene_diag = max(float(np.linalg.norm(high - low)), 1.0e-6)
     threshold = scene_diag * 0.004
 
@@ -4200,9 +4310,8 @@ def _load_guides_only_state(output: Path):
     elif proxy_obj.exists():
         proxy_vertices, proxy_faces = read_obj_mesh(proxy_obj)
     else:
-        raise RuntimeError(
-            "Guides-only refresh requires the cached proxy mesh."
-        )
+        # Camera-first result (no dense stage yet): fit guides to sparse points.
+        proxy_vertices, proxy_faces = np.zeros((0, 3), dtype=np.float64), []
 
     meshfit_obj_value = geometry.get("meshfit_planes_obj")
     meshfit_obj = (
@@ -5953,7 +6062,22 @@ def main():
     parser.add_argument("--meshfit-min-area-fraction", type=float, default=0.002)
     parser.add_argument("--meshfit-max-surfaces", type=int, default=20)
     parser.add_argument("--meshfit-padding", type=float, default=0.04)
-    parser.add_argument("--skip-dense", action="store_true")
+    parser.add_argument(
+        "--skip-dense",
+        action="store_true",
+        help=(
+            "Camera first: deliver camera, lens and sparse-fitted guides without "
+            "dense geometry. A later --geometry-only run adds the geometry."
+        ),
+    )
+    parser.add_argument(
+        "--geometry-only",
+        action="store_true",
+        help=(
+            "Build dense geometry for an existing solve in --output. Never re-runs "
+            "feature extraction, matching or mapping; fails if no solve is cached."
+        ),
+    )
     sparse_recovery.add_arguments(parser)
 
     # Speed settings. "legacy" reproduces the pre-speed-up pipeline exactly so
@@ -5988,6 +6112,8 @@ def main():
 
     args = parser.parse_args()
     print(f"[AUTOLENS SPEED] Profile: {args.speed_profile}")
+    if args.geometry_only and (args.skip_dense or args.force):
+        raise SystemExit("--geometry-only can't be combined with --skip-dense or --force.")
 
     # Catch packaging/runtime symbol errors before starting expensive COLMAP work.
     engine_runtime_preflight()
@@ -6080,6 +6206,14 @@ def main():
     sparse = output / "sparse"
     cached_sparse = find_cached_sparse_root(output, cache)
     recovery_report = (cache or {}).get("sparse_recovery")
+
+    if args.geometry_only and cached_sparse is None:
+        message = (
+            "--geometry-only needs a finished camera solve in this output folder. "
+            "Run the solve first (it can be camera-only with --skip-dense)."
+        )
+        write_geometry_status(output, "failed", error=message)
+        raise RuntimeError(message)
 
     if cached_sparse is not None:
         sparse = cached_sparse
@@ -6511,127 +6645,140 @@ def main():
     guided_surfaces_metadata = None
     propagated_depth = None
 
+    # Filled by the dense stage; empty on a camera-first (--skip-dense) run,
+    # where guided surfaces fit to the sparse points alone.
+    proxy_vertices = np.zeros((0, 3), dtype=np.float64)
+    proxy_faces = []
+
     if not args.skip_dense:
-        dense_info = run_dense_reconstruction(
-            colmap=colmap,
-            images_dir=images_dir,
-            best_model=best_model,
-            output=output,
-            poses=poses,
-            observations=observations,
-            settings=dense_settings,
-            force_dense=args.force_dense,
-            speed_profile=args.speed_profile,
-        )
+        write_geometry_status(output, "building", step=7, total=TOTAL_STEPS,
+                              stage="Preparing dense reconstruction")
+        try:
+            dense_info = run_dense_reconstruction(
+                colmap=colmap,
+                images_dir=images_dir,
+                best_model=best_model,
+                output=output,
+                poses=poses,
+                observations=observations,
+                settings=dense_settings,
+                force_dense=args.force_dense,
+                speed_profile=args.speed_profile,
+            )
 
-        selection_report_path = output / "autolens_dense_selection.json"
-        selection_report_path.write_text(
-            json.dumps(dense_info["selection_report"], indent=2),
-            encoding="utf-8",
-        )
+            selection_report_path = output / "autolens_dense_selection.json"
+            selection_report_path.write_text(
+                json.dumps(dense_info["selection_report"], indent=2),
+                encoding="utf-8",
+            )
 
-        show_progress(
-            11,
-            "Building projection geometry",
-            "Creating proxy OBJ and connected mesh-fit planar proxies."
-        )
+            show_progress(
+                11,
+                "Building projection geometry",
+                "Creating proxy OBJ and connected mesh-fit planar proxies."
+            )
 
-        geometry_started = time.perf_counter()
-        proxy_vertices, proxy_faces = read_ply_mesh(
-            dense_info["proxy_ply"]
-        )
+            geometry_started = time.perf_counter()
+            proxy_vertices, proxy_faces = read_ply_mesh(
+                dense_info["proxy_ply"]
+            )
 
-        proxy_vertices = apply_world_rotation_to_vertices(
-            proxy_vertices,
-            world_rotation,
-        )
+            proxy_vertices = apply_world_rotation_to_vertices(
+                proxy_vertices,
+                world_rotation,
+            )
 
-        proxy_obj = output / "autolens_proxy_mesh.obj"
-        write_mesh_obj(proxy_obj, proxy_vertices, proxy_faces)
+            proxy_obj = output / "autolens_proxy_mesh.obj"
+            write_mesh_obj(proxy_obj, proxy_vertices, proxy_faces)
 
-        meshfit_surfaces, meshfit_diagnostics = extract_meshfit_surfaces(
-            proxy_vertices,
-            proxy_faces,
-            poses,
-            angle_degrees=args.meshfit_angle,
-            distance_ratio=args.meshfit_distance_ratio,
-            min_faces=args.meshfit_min_faces,
-            min_area_fraction=args.meshfit_min_area_fraction,
-            max_surfaces=args.meshfit_max_surfaces,
-            padding=args.meshfit_padding,
-        )
+            meshfit_surfaces, meshfit_diagnostics = extract_meshfit_surfaces(
+                proxy_vertices,
+                proxy_faces,
+                poses,
+                angle_degrees=args.meshfit_angle,
+                distance_ratio=args.meshfit_distance_ratio,
+                min_faces=args.meshfit_min_faces,
+                min_area_fraction=args.meshfit_min_area_fraction,
+                max_surfaces=args.meshfit_max_surfaces,
+                padding=args.meshfit_padding,
+            )
 
-        if meshfit_surfaces:
-            meshfit_planes_obj = output / "autolens_meshfit_planes.obj"
-            write_meshfit_planes_obj(meshfit_planes_obj, meshfit_surfaces)
-        record_timing("projection_geometry", time.perf_counter() - geometry_started)
+            if meshfit_surfaces:
+                meshfit_planes_obj = output / "autolens_meshfit_planes.obj"
+                write_meshfit_planes_obj(meshfit_planes_obj, meshfit_surfaces)
+            record_timing("projection_geometry", time.perf_counter() - geometry_started)
 
-        if args.surface_guides:
-            guide_path = Path(args.surface_guides).resolve()
-            if guide_path.exists():
-                guided_started = time.perf_counter()
-                print(
-                    "\n[AUTOLENS] Fitting user-drawn 2D surface guides "
-                    "into the solved 3D scene..."
+            print("\nGeometry summary:")
+            print(f"  Proxy mesh:       {proxy_obj}")
+            print(f"  Mesh-fit planes:  {meshfit_planes_obj}")
+            print(f"  Plane patches:    {len(meshfit_surfaces)}")
+        except BaseException as exc:
+            write_geometry_status(output, "failed", error=str(exc) or type(exc).__name__)
+            raise
+        geometry_status = "ready"
+    else:
+        geometry_status = "none"
+
+    if args.surface_guides:
+        guide_path = Path(args.surface_guides).resolve()
+        if guide_path.exists():
+            guided_started = time.perf_counter()
+            print(
+                "\n[AUTOLENS] Fitting user-drawn 2D surface guides "
+                "into the solved 3D scene..."
+            )
+            try:
+                (
+                    guided_surfaces_obj,
+                    guided_surfaces_report,
+                    guided_surfaces_metadata,
+                ) = build_guided_surfaces(
+                    guide_path,
+                    cam,
+                    poses,
+                    points,
+                    best_txt / "images.txt",
+                    proxy_vertices,
+                    proxy_faces,
+                    output,
                 )
-                try:
-                    (
-                        guided_surfaces_obj,
-                        guided_surfaces_report,
-                        guided_surfaces_metadata,
-                    ) = build_guided_surfaces(
-                        guide_path,
-                        cam,
-                        poses,
-                        points,
-                        best_txt / "images.txt",
-                        proxy_vertices,
-                        proxy_faces,
-                        output,
-                    )
 
-                    if guided_surfaces_metadata is not None:
-                        try:
-                            guided_surfaces_metadata["guide_sha256"] = file_sha256(
-                                guide_path
-                            )
-                        except Exception:
-                            pass
-
-                    print(
-                        f"  Guided surfaces:   {guided_surfaces_obj}"
-                    )
-                    if guided_surfaces_metadata is not None:
-                        print(
-                            "  Guided count:      "
-                            f"{guided_surfaces_metadata.get('successful_surface_count', 0)}"
+                if guided_surfaces_metadata is not None:
+                    try:
+                        guided_surfaces_metadata["guide_sha256"] = file_sha256(
+                            guide_path
                         )
+                    except Exception:
+                        pass
 
-                except Exception as exc:
+                print(
+                    f"  Guided surfaces:   {guided_surfaces_obj}"
+                )
+                if guided_surfaces_metadata is not None:
                     print(
-                        "\n[AUTOLENS WARNING] Surface-guide fitting "
-                        f"was skipped: {exc}"
-                    )
-                    print(
-                        "[AUTOLENS WARNING] The camera, lens, proxy mesh "
-                        "and mesh-fit planes are still valid."
+                        "  Guided count:      "
+                        f"{guided_surfaces_metadata.get('successful_surface_count', 0)}"
                     )
 
-                    guided_surfaces_obj = None
-                    guided_surfaces_report = None
-                    guided_surfaces_metadata = {
-                        "status": "skipped",
-                        "error": str(exc),
-                        "successful_surface_count": 0,
-                    }
-                record_timing("guided_surfaces", time.perf_counter() - guided_started)
+            except Exception as exc:
+                print(
+                    "\n[AUTOLENS WARNING] Surface-guide fitting "
+                    f"was skipped: {exc}"
+                )
+                print(
+                    "[AUTOLENS WARNING] The camera, lens, proxy mesh "
+                    "and mesh-fit planes are still valid."
+                )
 
-        print("\nGeometry summary:")
-        print(f"  Proxy mesh:       {proxy_obj}")
-        print(f"  Mesh-fit planes:  {meshfit_planes_obj}")
-        print(f"  Plane patches:    {len(meshfit_surfaces)}")
+                guided_surfaces_obj = None
+                guided_surfaces_report = None
+                guided_surfaces_metadata = {
+                    "status": "skipped",
+                    "error": str(exc),
+                    "successful_surface_count": 0,
+                }
+            record_timing("guided_surfaces", time.perf_counter() - guided_started)
 
-        propagated_depth = None
 
     result = {
         "version": "0.10.30",
@@ -6685,6 +6832,9 @@ def main():
             "diagnostics": meshfit_diagnostics,
             "surfaces": meshfit_surfaces,
         },
+        # "none" after a camera-only (--skip-dense) solve, "ready" with geometry.
+        # autolens_geometry_status.json carries the same value plus progress.
+        "geometry_status": geometry_status,
         "dense": None if dense_info is None else {
             "workspace": str(dense_info["workspace"]),
             "quality": dense_settings["quality"],
@@ -6729,6 +6879,16 @@ def main():
         guided_surfaces_obj=guided_surfaces_obj,
         guided_surface_count=(guided_surfaces_metadata or {}).get("successful_surface_count", 0),
         source_format=source_format,
+    )
+
+    # Written last, once autolens_result.json and the .nk are complete.
+    write_geometry_status(
+        output,
+        geometry_status,
+        proxy_mesh_obj=str(proxy_obj) if proxy_obj else None,
+        meshfit_planes_obj=str(meshfit_planes_obj) if meshfit_planes_obj else None,
+        guided_surfaces_obj=str(guided_surfaces_obj) if guided_surfaces_obj else None,
+        quality=dense_settings["quality"] if dense_info is not None else None,
     )
 
     total_elapsed = time.perf_counter() - total_started

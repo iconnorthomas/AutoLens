@@ -77,6 +77,10 @@ RUN_MODES = (
     "Resume / reuse cached stages",
     "Rebuild dense only",
     "Rebuild everything",
+    # Camera-first: solve and deliver the camera and lens, plus guides fitted
+    # to sparse points, without dense geometry. A later Resume run reuses the
+    # cached solve and only builds the geometry.
+    "Camera only (geometry later)",
 )
 
 
@@ -87,6 +91,8 @@ def run_mode_args(index):
         return ["--force-dense"]
     if index == 2:
         return ["--force"]
+    if index == 3:
+        return ["--skip-dense"]
     return []
 
 

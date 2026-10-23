@@ -58,10 +58,11 @@ class PresetTests(unittest.TestCase):
 
 class RunModeTests(unittest.TestCase):
     def test_run_mode_args(self):
-        self.assertEqual(len(ux.RUN_MODES), 3)
+        self.assertEqual(len(ux.RUN_MODES), 4)
         self.assertEqual(ux.run_mode_args(0), [])
         self.assertEqual(ux.run_mode_args(1), ["--force-dense"])
         self.assertEqual(ux.run_mode_args(2), ["--force"])
+        self.assertEqual(ux.run_mode_args(3), ["--skip-dense"])
         self.assertEqual(ux.run_mode_args(-1), [])
 
 
