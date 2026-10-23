@@ -56,5 +56,84 @@ class MeshfitObjTests(unittest.TestCase):
         self.assertIn("g WALL_01", lines)
 
 
+class FakeKnob(object):
+    def __init__(self, node, name, value="", values=()):
+        self.node, self._name, self._value, self._values = node, name, value, list(values)
+
+    def name(self):
+        return self._name
+
+    def value(self):
+        return self._value
+
+    def values(self):
+        return list(self._values)
+
+    def setValue(self, value):
+        self._value = value
+        self.node.changed(self)
+
+    def setValues(self, values):
+        self._values = list(values)
+        self.node.changed(self)
+
+
+class FakeNode(object):
+    """Fires knobChanged synchronously on every knob write, like Nuke."""
+
+    def __init__(self):
+        self.knobs = {
+            "autolens_output_root": FakeKnob(self, "autolens_output_root", "/shots/a/AutoLens"),
+            "autolens_version": FakeKnob(self, "autolens_version"),
+            "autolens_output": FakeKnob(self, "autolens_output"),
+        }
+        self.callbacks = 0
+
+    def fullName(self):
+        return "AutoLens1"
+
+    def knob(self, name):
+        return self.knobs.get(name)
+
+    def changed(self, knob):
+        self.callbacks += 1
+        if self.callbacks > 50:
+            raise RuntimeError("knobChanged loop")
+        node.autolens_knob_changed(self, knob)
+
+
+class KnobChangedLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.scheduled = []
+        self._saved = (node.discover_solve_versions, node._next_solve_version,
+                       node._schedule_version_ui_refresh, node.refresh_result_status,
+                       node.refresh_create_items)
+        node.discover_solve_versions = lambda root: ["v1", "v2"]
+        node._next_solve_version = lambda root: "v3"
+        node._schedule_version_ui_refresh = self.scheduled.append
+        node.refresh_result_status = lambda n: None
+        node.refresh_create_items = lambda n, force_rebuild=False: None
+
+    def tearDown(self):
+        (node.discover_solve_versions, node._next_solve_version,
+         node._schedule_version_ui_refresh, node.refresh_result_status,
+         node.refresh_create_items) = self._saved
+
+    def test_own_knob_writes_do_not_retrigger(self):
+        fake = FakeNode()
+        node.autolens_knob_changed(fake, fake.knob("autolens_output_root"))
+        self.assertEqual(fake.knob("autolens_version").value(), "Latest (v2)")
+        self.assertEqual(len(self.scheduled), 1)
+
+    def test_show_panel_twice_writes_nothing_the_second_time(self):
+        fake = FakeNode()
+        panel = FakeKnob(fake, "showPanel")
+        node.autolens_knob_changed(fake, panel)
+        writes = fake.callbacks
+        node.autolens_knob_changed(fake, panel)
+        self.assertEqual(fake.callbacks, writes)
+        self.assertEqual(self.scheduled, [])
+
+
 if __name__ == "__main__":
     unittest.main()

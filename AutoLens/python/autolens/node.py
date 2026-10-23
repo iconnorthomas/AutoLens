@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import os
 import re
@@ -18,6 +19,23 @@ def _selected_input():
 
 
 _PENDING_VERSION_UI_REFRESH = set()
+
+# Nodes whose knobs AutoLens itself is updating. The knobChanged callback
+# ignores those changes, otherwise each refresh fires knobChanged, which
+# schedules another refresh, forever.
+_REFRESHING_NODES = set()
+
+
+@contextmanager
+def _refreshing(node_fullname):
+    key = str(node_fullname)
+    nested = key in _REFRESHING_NODES
+    _REFRESHING_NODES.add(key)
+    try:
+        yield
+    finally:
+        if not nested:
+            _REFRESHING_NODES.discard(key)
 
 
 def _run_deferred_version_ui_refresh(node_fullname):
@@ -43,15 +61,16 @@ def _run_deferred_version_ui_refresh(node_fullname):
         return
 
     try:
-        refresh_version_menu(
-            node,
-            prefer_latest=False,
-        )
-        refresh_result_status(node)
-        refresh_create_items(
-            node,
-            force_rebuild=True,
-        )
+        with _refreshing(node_fullname):
+            refresh_version_menu(
+                node,
+                prefer_latest=False,
+            )
+            refresh_result_status(node)
+            refresh_create_items(
+                node,
+                force_rebuild=True,
+            )
     except Exception:
         pass
 
@@ -275,9 +294,15 @@ def refresh_version_menu(node, prefer_latest=False):
         previous = ""
 
     try:
-        version_knob.setValues(values)
+        current_values = list(version_knob.values())
     except Exception:
-        pass
+        current_values = None
+
+    if current_values != values:
+        try:
+            version_knob.setValues(values)
+        except Exception:
+            pass
 
     if prefer_latest or previous not in values:
         target = (
@@ -311,7 +336,8 @@ def refresh_version_menu(node, prefer_latest=False):
 
     if legacy is not None:
         try:
-            legacy.setValue(resolved)
+            if legacy.value() != resolved:
+                legacy.setValue(resolved)
         except Exception:
             pass
 
@@ -1693,9 +1719,21 @@ def autolens_knob_changed(node, knob):
 
     try:
         name = knob.name()
+        key = node.fullName()
     except Exception:
         return
 
+    if name not in _KNOB_CHANGED_WATCHED or key in _REFRESHING_NODES:
+        return
+
+    with _refreshing(key):
+        _handle_knob_changed(node, name)
+
+
+_KNOB_CHANGED_WATCHED = ("autolens_output_root", "autolens_version", "showPanel")
+
+
+def _handle_knob_changed(node, name):
     if name == "autolens_output_root":
         refresh_version_menu(
             node,
