@@ -25,6 +25,10 @@
 - Fix: the workspace's keyboard shortcuts used `QtGui.QShortcut`, which only exists in Qt 6;
   PySide2 (Nuke 14/15) has it in `QtWidgets`.
 
+- **Build label for test installs.** Installing from a git checkout records the branch, commit,
+  pull request number and uncommitted-changes flag in `autolens_build.json`, and the workspace
+  shows it next to the version, e.g. `AutoLens 0.10.30 (PR #8 · d9bf93a)`. Release installs show
+  only the version.
 - **Version guard and release workflow** for maintainers (`scripts/release.py`, README
   *Version numbers and releases*). Pull requests run the unit tests and a *Version check*: a
   branch that changes `__version__` must raise it above `main` and every posted release, keep

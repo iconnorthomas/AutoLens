@@ -35,6 +35,7 @@ from .preview_loader import (
     supported_extensions,
     worker_decoder,
 )
+from .build import version_text
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
 from .surface_guides import (
@@ -1008,7 +1009,7 @@ class AutoLensBackgroundMonitor(QtWidgets.QDialog):
         self.owner = owner
 
         self.setWindowTitle(
-            f"AutoLens {__version__} - DeadCow VFX"
+            f"AutoLens {version_text(__version__)} - DeadCow VFX"
         )
 
         try:
@@ -1041,7 +1042,7 @@ class AutoLensBackgroundMonitor(QtWidgets.QDialog):
         title_row = QtWidgets.QHBoxLayout()
 
         self.title_label = QtWidgets.QLabel(
-            f"<b>AutoLens {__version__}</b>"
+            f"<b>AutoLens {version_text(__version__)}</b>"
         )
         self.node_label = QtWidgets.QLabel(
             owner.controller_node.name()
@@ -1204,7 +1205,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._syncing_list = False
 
         self.setWindowTitle(
-            f"AutoLens {__version__} - DeadCow VFX"
+            f"AutoLens {version_text(__version__)} - DeadCow VFX"
         )
         self.background_monitor = None
 
@@ -1270,7 +1271,7 @@ class AutoLensDialog(QtWidgets.QDialog):
 
         title = QtWidgets.QLabel(
             f"<b>AutoLens</b> "
-            f"<span style='color:#8d8d8d;'>v{__version__}</span> "
+            f"<span style='color:#8d8d8d;'>v{version_text(__version__)}</span> "
             f"<span style='color:#666666;'>• DeadCow VFX</span>"
         )
         title.setStyleSheet("font-size: 14px;")
