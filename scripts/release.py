@@ -50,7 +50,7 @@ SYNCED = [
 ]
 
 # What goes in the release zip, relative to ROOT.
-PACKAGE_FILES = ["install_autolens.bat", "install_autolens.py", "README.md"]
+PACKAGE_FILES = ["install_autolens.bat", "install_autolens.py", "README.md", "LICENSE", "NOTICE"]
 PACKAGE_DIRS = ["AutoLens"]
 
 
