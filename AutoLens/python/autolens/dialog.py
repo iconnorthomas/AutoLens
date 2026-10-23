@@ -14,7 +14,7 @@ except ImportError:
     from PySide2 import QtCore, QtGui, QtWidgets
     Signal = QtCore.Signal
 
-from . import __version__
+from . import __version__, icons, theme, ux
 from .frame_cache import (
     PlaybackClock,
     bucket_width,
@@ -37,6 +37,7 @@ from .preview_loader import (
 )
 from .build import version_text
 from .startup import defer_initial_preview, timed
+from .ux import timeline_tick_step as tick_step
 from .panel import AutoLensPanel
 from .node import source_read_for_node, set_status
 from .surface_guides import (
@@ -111,6 +112,131 @@ WIDGET_WITH_CHILDREN_SHORTCUT = getattr(
         3,
     ),
 )
+
+
+_HORIZONTAL = getattr(
+    QtCore.Qt,
+    "Horizontal",
+    getattr(getattr(QtCore.Qt, "Orientation", object()), "Horizontal", 1),
+)
+_ALIGN_RIGHT = getattr(
+    QtCore.Qt,
+    "AlignRight",
+    getattr(getattr(QtCore.Qt, "AlignmentFlag", object()), "AlignRight", 2),
+) | getattr(
+    QtCore.Qt,
+    "AlignVCenter",
+    getattr(getattr(QtCore.Qt, "AlignmentFlag", object()), "AlignVCenter", 0x80),
+)
+_NO_BUTTONS = getattr(
+    QtWidgets.QAbstractSpinBox,
+    "NoButtons",
+    getattr(getattr(QtWidgets.QAbstractSpinBox, "ButtonSymbols", object()), "NoButtons", 2),
+)
+_SIZE_IGNORED = getattr(
+    QtWidgets.QSizePolicy,
+    "Ignored",
+    getattr(getattr(QtWidgets.QSizePolicy, "Policy", object()), "Ignored", 13),
+)
+_SIZE_PREFERRED = getattr(
+    QtWidgets.QSizePolicy,
+    "Preferred",
+    getattr(getattr(QtWidgets.QSizePolicy, "Policy", object()), "Preferred", 5),
+)
+
+_STEP_TIPS = {
+    "track": "Track: solve the camera and lens from the plate (mask moving objects first)",
+    "draw": "Draw: optional planes over flat surfaces, each with its own guide frame",
+    "output": "Output: Create All, single assets, and geometry status",
+}
+
+
+# Small builders for the Match-style workspace.
+def _frame(name):
+    f = QtWidgets.QFrame()
+    f.setObjectName(name)
+    return f
+
+
+def _hbox(parent, margins=(12, 0, 12, 0), spacing=6):
+    lay = QtWidgets.QHBoxLayout(parent)
+    lay.setContentsMargins(*margins)
+    lay.setSpacing(spacing)
+    return lay
+
+
+def _vbox(parent, margins=(12, 10, 12, 10), spacing=8):
+    lay = QtWidgets.QVBoxLayout(parent)
+    lay.setContentsMargins(*margins)
+    lay.setSpacing(spacing)
+    return lay
+
+
+def _label(text, name=None):
+    lab = QtWidgets.QLabel(text)
+    if name:
+        lab.setObjectName(name)
+    return lab
+
+
+def _wrap(label):
+    label.setWordWrap(True)
+    return label
+
+
+def _elide(label):
+    # Long text is cut off instead of widening the window.
+    label.setSizePolicy(_SIZE_IGNORED, _SIZE_PREFERRED)
+    return label
+
+
+def _separator():
+    s = _frame("Separator")
+    s.setFixedSize(1, 22)
+    return s
+
+
+def _icon_button(icon_name, tip, name="Tool", colour=None):
+    b = QtWidgets.QPushButton()
+    b.setObjectName(name)
+    b.setAutoDefault(False)
+    b.setIcon(icons.icon(icon_name, colour) if colour else icons.icon(icon_name))
+    b.setIconSize(icons.icon_size())
+    b.setToolTip(tip)
+    return b
+
+
+def _menu_button(text):
+    b = QtWidgets.QPushButton(text)
+    b.setObjectName("MenuBarButton")
+    b.setAutoDefault(False)
+    b.setFocusPolicy(NO_FOCUS)
+    m = QtWidgets.QMenu(b)
+    b.setMenu(m)
+    return b, m
+
+
+def _action(menu, text, slot, key=None, checkable=False, tip=""):
+    """Menu entry. `key` is only shown; the window's shortcuts do the work."""
+    a = menu.addAction(text + ("\t" + key if key else ""))
+    a.setCheckable(checkable)
+    if tip:
+        a.setToolTip(tip)
+        a.setStatusTip(tip)
+    a.triggered.connect(lambda *_: slot())
+    return a
+
+
+def _action_group(parent):
+    cls = getattr(QtWidgets, "QActionGroup", None) or QtGui.QActionGroup
+    group = cls(parent)
+    group.setExclusive(True)
+    return group
+
+
+def _repolish(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
 
 
 def _active_window():
@@ -365,7 +491,7 @@ class SurfaceCanvas(QtWidgets.QWidget):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QtGui.QColor(18, 18, 18))
+        painter.fillRect(self.rect(), QtGui.QColor(theme.BG_0))
 
         image_rect, _ = self._image_rect()
 
@@ -701,8 +827,8 @@ class GuideTimeline(QtWidgets.QWidget):
         self.cached_ranges = []
         self.disk_ranges = []
         self.scrubbing = False
-        self.setMinimumHeight(52)
-        self.setMaximumHeight(64)
+        self.setMinimumHeight(58)
+        self.setMaximumHeight(62)
         self.setMouseTracking(True)
         self.setFocusPolicy(CLICK_FOCUS)
 
@@ -757,11 +883,17 @@ class GuideTimeline(QtWidgets.QWidget):
         })
         self.update()
 
+    # Lane layout: labels in a left gutter, as in Match's timeline.
+    GUTTER = 64
+    RIGHT_PAD = 14
+    RULER_Y = 16
+    LANES = (("Guides", 30), ("Cache", 48))
+
     def _x_for_frame(self, frame):
-        left = 12.0
+        left = float(self.GUTTER)
         right = max(
             left + 1.0,
-            float(self.width()) - 12.0,
+            float(self.width()) - self.RIGHT_PAD,
         )
         span = max(
             1,
@@ -774,10 +906,10 @@ class GuideTimeline(QtWidgets.QWidget):
         return left + t * (right - left)
 
     def _frame_for_x(self, x):
-        left = 12.0
+        left = float(self.GUTTER)
         right = max(
             left + 1.0,
-            float(self.width()) - 12.0,
+            float(self.width()) - self.RIGHT_PAD,
         )
         t = (
             float(x) - left
@@ -803,163 +935,68 @@ class GuideTimeline(QtWidgets.QWidget):
             QtGui.QPainter.Antialiasing,
             False,
         )
+        painter.fillRect(self.rect(), QtGui.QColor(theme.BG_1))
 
-        painter.fillRect(
-            self.rect(),
-            QtGui.QColor(31, 31, 31),
-        )
+        left = self.GUTTER
+        right = self.width() - self.RIGHT_PAD
+        height = self.height()
+        line = QtGui.QColor(theme.LINE)
+        faint = QtGui.QColor(theme.TEXT_FAINT)
+        dim = QtGui.QColor(theme.TEXT_DIM)
+        font = painter.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.85))
+        painter.setFont(font)
 
-        y = 18
-        left = 12
-        right = self.width() - 12
+        # Ruler: a thin line with labelled ticks at a readable spacing.
+        frame_count = max(1, self.last_frame - self.first_frame)
+        step = tick_step(frame_count, max(1, right - left))
+        painter.setPen(QtGui.QPen(QtGui.QColor(theme.CACHE_DISK), 1))
+        painter.drawLine(left, self.RULER_Y + 4, right, self.RULER_Y + 4)
+        first_tick = ((self.first_frame + step - 1) // step) * step
+        for frame in range(first_tick, self.last_frame + 1, step):
+            x = int(round(self._x_for_frame(frame)))
+            painter.setPen(line)
+            painter.drawLine(x, self.RULER_Y + 6, x, height)
+            painter.setPen(faint)
+            painter.drawText(x + 3, self.RULER_Y, str(frame))
 
-        painter.setPen(
-            QtGui.QPen(
-                QtGui.QColor(90, 90, 90),
-                1,
-            )
-        )
-        painter.drawLine(
-            left,
-            y,
-            right,
-            y,
-        )
+        # Lane labels and separators.
+        for text, y in self.LANES:
+            painter.setPen(dim)
+            painter.drawText(10, y + 4, text)
 
-        frame_count = max(
-            1,
-            self.last_frame - self.first_frame + 1,
-        )
+        # Guides lane: one mark per surface guide frame.
+        guide_y = self.LANES[0][1]
+        guide = QtGui.QColor(theme.GUIDE)
+        for frame in self.markers:
+            x = int(round(self._x_for_frame(frame)))
+            painter.fillRect(x - 2, guide_y - 6, 5, 12, guide)
 
-        # Keep tick density readable while preserving the Mocha-like feel.
-        tick_step = max(
-            1,
-            int(
-                frame_count / max(
-                    1,
-                    self.width() // 10,
-                )
-            ),
-        )
-
-        painter.setPen(
-            QtGui.QColor(150, 150, 150)
-        )
-
-        for frame in range(
-            self.first_frame,
-            self.last_frame + 1,
-            tick_step,
-        ):
-            x = int(
-                round(
-                    self._x_for_frame(
-                        frame
-                    )
-                )
-            )
-            painter.drawLine(
-                x,
-                y - 5,
-                x,
-                y + 5,
-            )
-
-        # Cache bar under the ruler, like Nuke's viewer: dark green = proxy
-        # rendered to disk, bright green = decoded and ready to play.
+        # Cache lane: dark = proxy rendered to disk, bright = decoded in memory.
+        cache_y = self.LANES[1][1]
+        painter.fillRect(left, cache_y - 1, max(1, right - left), 3, QtGui.QColor("#1a1d21"))
         for ranges, color in (
-            (self.disk_ranges, QtGui.QColor(40, 95, 50)),
-            (self.cached_ranges, QtGui.QColor(80, 200, 95)),
+            (self.disk_ranges, QtGui.QColor(theme.CACHE_DISK)),
+            (self.cached_ranges, QtGui.QColor(theme.CACHE)),
         ):
             for start, end in ranges:
-                x0 = int(round(self._x_for_frame(start - 0.5)))
-                x1 = int(round(self._x_for_frame(end + 0.5)))
-                x0 = max(left, x0)
-                x1 = min(right, x1)
+                x0 = max(left, int(round(self._x_for_frame(start - 0.5))))
+                x1 = min(right, int(round(self._x_for_frame(end + 0.5))))
                 if x1 >= x0:
-                    painter.fillRect(
-                        x0,
-                        y + 7,
-                        max(1, x1 - x0),
-                        3,
-                        color,
-                    )
+                    painter.fillRect(x0, cache_y - 1, max(1, x1 - x0), 3, color)
 
-        # Guided frames = blue marks.
-        painter.setPen(
-            QtGui.QPen(
-                QtGui.QColor(55, 145, 255),
-                3,
-            )
-        )
-
-        for frame in self.markers:
-            x = int(
-                round(
-                    self._x_for_frame(
-                        frame
-                    )
-                )
-            )
-            painter.drawLine(
-                x,
-                y - 10,
-                x,
-                y + 11,
-            )
-
-        # Current frame = warm playhead.
-        current_x = int(
-            round(
-                self._x_for_frame(
-                    self.current_frame
-                )
-            )
-        )
-
-        painter.setPen(
-            QtGui.QPen(
-                QtGui.QColor(255, 145, 45),
-                2,
-            )
-        )
-        painter.drawLine(
-            current_x,
-            4,
-            current_x,
-            self.height() - 5,
-        )
-
-        painter.setPen(
-            QtGui.QColor(80, 170, 255)
-        )
-        painter.drawText(
-            QtCore.QRect(
-                10,
-                31,
-                95,
-                18,
-            ),
-            f"{self.current_frame}",
-        )
-
-        painter.setPen(
-            QtGui.QColor(120, 120, 120)
-        )
-        painter.drawText(
-            QtCore.QRect(
-                self.width() - 180,
-                31,
-                168,
-                18,
-            ),
-            getattr(
-                QtCore.Qt,
-                "AlignRight",
-                0x0002,
-            ),
-            f"{self.first_frame} — {self.last_frame}",
-        )
+        # Playhead.
+        current_x = int(round(self._x_for_frame(self.current_frame)))
+        painter.setPen(QtGui.QPen(QtGui.QColor(theme.PLAYHEAD), 2))
+        painter.drawLine(current_x, self.RULER_Y + 2, current_x, height - 2)
+        painter.setBrush(QtGui.QColor(theme.PLAYHEAD))
+        painter.setPen(QtCore.Qt.NoPen if hasattr(QtCore.Qt, "NoPen") else QtCore.Qt.PenStyle.NoPen)
+        painter.drawPolygon(QtGui.QPolygon([
+            QtCore.QPoint(current_x - 5, self.RULER_Y - 4),
+            QtCore.QPoint(current_x + 5, self.RULER_Y - 4),
+            QtCore.QPoint(current_x, self.RULER_Y + 3),
+        ]))
+        painter.end()
 
     def mousePressEvent(self, event):
         pos = (
@@ -1224,6 +1261,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         with timed("dialog: load node settings"):
             self._load_node_settings(self.read_node)
         self._wire_node_sync()
+        self._set_step("track")
 
         # The plate preview can mean a Nuke render (EXR, TIFF), so by default
         # it loads on the first event-loop turn after the window is shown.
@@ -1256,230 +1294,270 @@ class AutoLensDialog(QtWidgets.QDialog):
             self._reload_surfaces()
             self._reload_masks()
             self._refresh_timeline()
+            # The workspace opens on Track: show the mask overlay there.
+            self._sidebar_tab_changed(self.sidebar.currentIndex())
+            self._refresh_workflow()
 
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
     def _build_ui(self):
-        self.setStyleSheet("""
-            QDialog { background: #252525; color: #d7d7d7; }
-            QGroupBox {
-                border: 1px solid #454545;
-                border-radius: 3px;
-                margin-top: 8px;
-                padding-top: 8px;
-            }
-            QTabWidget::pane { border: 1px solid #454545; }
-            QTabBar::tab {
-                background: #303030;
-                border: 1px solid #454545;
-                padding: 7px 13px;
-            }
-            QTabBar::tab:selected { background: #454545; }
-            QPushButton { min-height: 25px; }
-            QListWidget { background: #1f1f1f; border: 1px solid #444; }
-        """)
+        """
+        Match-style workspace:
+
+          top bar      brand · menus · shot breadcrumb · Track › Draw › Output
+          middle       viewer (status chip, frame) | panel for the current step
+          bottom       transport + Track / Stop, then the timeline lanes
+          status bar   what to do next | last message
+
+        The panel only shows the current step. Everything else is in a menu,
+        the quality popover or Solve settings.
+        """
+        self.setObjectName("AutoLensWorkspace")
+        self.setStyleSheet(theme.STYLESHEET)
+        self._step = "track"
+        self._result_cache = (None, None, {})
+        self._last_percent = 0
 
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(5)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # Toolbar
-        toolbar = QtWidgets.QHBoxLayout()
+        # -- top bar: brand, menus, shot, workflow --------------------------
+        top = _frame("TopBar")
+        top.setFixedHeight(46)
+        tl = _hbox(top, (14, 0, 12, 0), 4)
+        tl.addWidget(_label("AUTOLENS", "Brand"))
+        tl.addSpacing(12)
+        file_btn, self.file_menu = _menu_button("File")
+        track_btn, self.track_menu = _menu_button("Track")
+        draw_btn, self.draw_menu = _menu_button("Draw")
+        output_btn, self.output_menu = _menu_button("Output")
+        view_btn, self.view_menu = _menu_button("View")
+        for b in (file_btn, track_btn, draw_btn, output_btn, view_btn):
+            tl.addWidget(b)
+        tl.addSpacing(10)
+        tl.addWidget(_separator())
+        tl.addSpacing(10)
+        self.shot_label = _elide(_label("No plate", "ShotInfo"))
+        tl.addWidget(self.shot_label, 1)
 
-        title = QtWidgets.QLabel(
-            f"<b>AutoLens</b> "
-            f"<span style='color:#8d8d8d;'>v{version_text(__version__)}</span> "
-            f"<span style='color:#666666;'>• DeadCow VFX</span>"
-        )
-        title.setStyleSheet("font-size: 14px;")
-        toolbar.addWidget(title)
+        self.step_buttons = {}
+        for index, (key, text) in enumerate(ux.WORKSPACE_STEPS):
+            if index:
+                tl.addWidget(_label("›", "StepArrow"))
+            b = QtWidgets.QPushButton(text)
+            b.setObjectName("Step")
+            b.setAutoDefault(False)
+            b.setFocusPolicy(NO_FOCUS)
+            b.setToolTip(_STEP_TIPS[key])
+            b.clicked.connect(lambda _c=False, k=key: self._set_step(k))
+            self.step_buttons[key] = b
+            tl.addWidget(b)
+        root.addWidget(top)
 
-        toolbar.addSpacing(12)
-
-        self.frame_label = QtWidgets.QLabel(f"Frame {int(nuke.frame())}")
-        toolbar.addWidget(self.frame_label)
-
-        toolbar.addStretch(1)
-
-        self.fit_button = QtWidgets.QPushButton("Fit")
-        toolbar.addWidget(self.fit_button)
-
-        root.addLayout(toolbar)
-
-        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        root.addWidget(self.main_splitter, 1)
-
-        # Left: viewer
-        viewer_frame = QtWidgets.QFrame()
+        # -- viewer: status chip and frame over the plate --------------------
+        viewer_frame = QtWidgets.QWidget()
+        viewer_frame.setStyleSheet(f"background: {theme.BG_0};")
         viewer_layout = QtWidgets.QVBoxLayout(viewer_frame)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
-
+        viewer_layout.setSpacing(0)
+        header = QtWidgets.QWidget()
+        hl = _hbox(header, (12, 6, 8, 4), 8)
+        self.chip = QtWidgets.QLabel("NOT SOLVED")
+        self.chip.setObjectName("Chip")
+        self.chip.setStyleSheet(theme.chip_style("none"))
+        self.chip.setToolTip(
+            "Track status. After a track it shows the mean reprojection error: "
+            "under about 1 px is a good solve."
+        )
+        hl.addWidget(self.chip)
+        hl.addStretch(1)
+        self.frame_label = _label(f"Frame {int(nuke.frame())}", "Faint")
+        hl.addWidget(self.frame_label)
+        self.fit_button = _icon_button("fit", "Fit the plate to the viewer (F)", name="Tool")
+        hl.addWidget(self.fit_button)
+        viewer_layout.addWidget(header)
         self.canvas = SurfaceCanvas()
         viewer_layout.addWidget(self.canvas, 1)
 
-        self.timeline = GuideTimeline()
-        viewer_layout.addWidget(self.timeline)
-        self._build_playback_bar(viewer_layout)
+        # -- side panel: one page per step -----------------------------------
+        side = _frame("SidePanel")
+        side_layout = _vbox(side, (14, 12, 14, 12), 10)
+        self.sidebar = QtWidgets.QStackedWidget()
+        side_layout.addWidget(self.sidebar, 1)
 
-        viewer_help = QtWidgets.QLabel(
-            "Drag surface corners directly in this viewer.  "
-            "Timeline: click/drag frame  •  Blue = surface guide frame  •  "
-            "Green = in memory  •  Space: play/pause  •  ←/→ or ,/.: step  •  "
-            "F: fit  •  Mouse wheel: zoom  •  Middle-drag: pan"
-        )
-        viewer_help.setStyleSheet("color: #888; padding: 3px;")
-        viewer_layout.addWidget(viewer_help)
-
-        self.main_splitter.addWidget(viewer_frame)
-
-        # Right: tab sidebar
-        sidebar = QtWidgets.QTabWidget()
-        self.sidebar = sidebar
-        sidebar.setMinimumWidth(390)
-        sidebar.setMaximumWidth(560)
-
-        # Surfaces tab
-        surfaces_tab = QtWidgets.QWidget()
-        sl = QtWidgets.QVBoxLayout(surfaces_tab)
-        sl.setContentsMargins(8, 8, 8, 8)
-
-        surfaces_help = QtWidgets.QLabel(
-            "Optional. Draw a plane over each flat surface you want as projection "
-            "geometry (floor, walls, signs). Skip this tab if you only need the "
-            "camera and lens."
-        )
-        surfaces_help.setWordWrap(True)
-        surfaces_help.setStyleSheet("color: #aaa;")
-        sl.addWidget(surfaces_help)
-
-        self.surface_list = QtWidgets.QListWidget()
-        self.surface_list.setToolTip("Surfaces sent to the solve. Select one to edit it in the viewer.")
-        sl.addWidget(self.surface_list, 1)
-
-        name_row = QtWidgets.QHBoxLayout()
-        self.surface_name_edit = QtWidgets.QLineEdit()
-        self.rename_button = QtWidgets.QPushButton("Rename")
-        self.surface_name_edit.setToolTip("New name for the selected surface. Its ReadGeo uses this name.")
-        self.rename_button.setToolTip("Rename the selected surface.")
-        name_row.addWidget(self.surface_name_edit, 1)
-        name_row.addWidget(self.rename_button)
-        sl.addLayout(name_row)
-
-        row = QtWidgets.QHBoxLayout()
-        self.surface_auto_button = QtWidgets.QPushButton("Auto Suggest")
-        self.surface_add_button = QtWidgets.QPushButton("Add Plane")
-        self.surface_auto_button.setToolTip(
-            "Guess rough floor, wall and object planes on the current frame. "
-            "Drag their corners to correct them."
-        )
-        self.surface_add_button.setToolTip(
-            "Add a plane on the current frame, then drag its four corners onto a flat surface."
-        )
-        row.addWidget(self.surface_auto_button)
-        row.addWidget(self.surface_add_button)
-        sl.addLayout(row)
-
-        row2 = QtWidgets.QHBoxLayout()
-        self.surface_delete_button = QtWidgets.QPushButton("Delete")
-        self.guide_frame_button = QtWidgets.QPushButton("Set Guide Frame")
-        self.surface_delete_button.setToolTip("Delete the selected surface.")
-        self.guide_frame_button.setToolTip(
-            "Make the current frame the selected surface's guide frame: the frame "
-            "its corners were drawn on. Other surfaces keep their own frames."
-        )
-        row2.addWidget(self.surface_delete_button)
-        row2.addWidget(self.guide_frame_button)
-        sl.addLayout(row2)
-
-        self.surface_status = QtWidgets.QLabel(
-            "Each surface can have its own guide frame. Green = its guide frame; gray = another frame."
-        )
-        self.surface_status.setWordWrap(True)
-        self.surface_status.setStyleSheet("color: #999;")
-        sl.addWidget(self.surface_status)
-
-        sidebar.addTab(surfaces_tab, "Surfaces")
-
-        # Masks tab
-        masks_tab = QtWidgets.QWidget()
-        ml = QtWidgets.QVBoxLayout(masks_tab)
-        ml.setContentsMargins(10, 10, 10, 10)
-
-        mask_title = QtWidgets.QLabel(
-            "<b>Tracking Mask Input</b>"
-        )
-        ml.addWidget(mask_title)
-
-        mask_help = QtWidgets.QLabel(
-            "Optional. Connect an alpha/matte to AutoLens input 2 to stop moving "
-            "objects (people, cars, reflections) from spoiling the camera solve. "
-            "The viewer shows the tracking exclusion region as 20% red. "
-            "By default alpha marks areas AutoLens should AVOID while tracking."
-        )
-        mask_help.setWordWrap(True)
-        mask_help.setStyleSheet("color: #aaa;")
-        ml.addWidget(mask_help)
-
-        self.mask_connection_status = QtWidgets.QLabel(
-            "No mask connected."
-        )
-        self.mask_connection_status.setWordWrap(True)
-        ml.addWidget(self.mask_connection_status)
-
-        self.mask_mode_label = QtWidgets.QLabel(
-            "Alpha meaning: AVOID / EXCLUDE"
-        )
-        self.mask_mode_label.setStyleSheet(
-            "color: #e18aa9; font-weight: 600;"
-        )
-        ml.addWidget(self.mask_mode_label)
-
-        self.mask_invert_button = QtWidgets.QPushButton(
-            "Invert"
-        )
+        # Track ---------------------------------------------------------------
+        track_page = QtWidgets.QWidget()
+        tp = _vbox(track_page, (0, 0, 0, 0), 8)
+        tp.addWidget(_label("TRACK", "Section"))
+        self.track_info = _wrap(_label("", "Dim"))
+        tp.addWidget(self.track_info)
+        self.track_row = QtWidgets.QHBoxLayout()
+        self.track_row.setSpacing(6)
+        tp.addLayout(self.track_row)   # Track button + quality popover, see _construct_panel
+        self.track_status_layout = QtWidgets.QVBoxLayout()
+        self.track_status_layout.setSpacing(6)
+        tp.addLayout(self.track_status_layout)  # progress, stage and Cancel
+        tp.addSpacing(10)
+        tp.addWidget(_label("TRACKING MASK", "Section"))
+        self.mask_connection_status = _wrap(_label("No mask connected.", "Dim"))
+        tp.addWidget(self.mask_connection_status)
+        mask_row = QtWidgets.QHBoxLayout()
+        self.mask_mode_label = _label("Alpha meaning: AVOID", "Dim")
+        mask_row.addWidget(self.mask_mode_label, 1)
+        self.mask_invert_button = QtWidgets.QPushButton("Invert")
+        self.mask_invert_button.setObjectName("Toggle")
         self.mask_invert_button.setCheckable(True)
+        self.mask_invert_button.setAutoDefault(False)
         self.mask_invert_button.setToolTip(
-            "Swap whether alpha means Avoid/Exclude or Keep/Track."
+            "Swap whether the mask's alpha means Avoid (default) or Keep. "
+            "The red overlay always shows what tracking will avoid."
         )
-        ml.addWidget(self.mask_invert_button)
+        mask_row.addWidget(self.mask_invert_button)
+        tp.addLayout(mask_row)
+        tp.addWidget(_wrap(_label(
+            "Optional: connect a matte to the TrackingMask input to keep moving "
+            "people, cars or reflections out of the track.",
+            "Faint",
+        )))
+        tp.addStretch(1)
+        self.masks_tab_index = self.sidebar.addWidget(track_page)
 
-        mask_preview_note = QtWidgets.QLabel(
-            "Viewer overlay: 20% red always shows what AutoLens will AVOID."
+        # Draw ----------------------------------------------------------------
+        draw_page = QtWidgets.QWidget()
+        dp = _vbox(draw_page, (0, 0, 0, 0), 8)
+        dp.addWidget(_label("SURFACES", "Section"))
+        self.draw_info = _wrap(_label("", "Dim"))
+        dp.addWidget(self.draw_info)
+        tools = QtWidgets.QHBoxLayout()
+        tools.setSpacing(4)
+        self.surface_add_button = _icon_button(
+            "plane", "Add plane (P): drag its four corners onto a flat surface", name="Tool")
+        self.surface_auto_button = _icon_button(
+            "wand", "Auto suggest: guess floor, wall and object planes on this frame", name="Tool")
+        self.guide_frame_button = _icon_button(
+            "flag", "Set guide frame (G): the selected surface was drawn on this frame", name="Tool")
+        self.surface_delete_button = _icon_button(
+            "trash", "Delete the selected surface (Del)", name="Tool")
+        for b in (self.surface_add_button, self.surface_auto_button, self.guide_frame_button):
+            tools.addWidget(b)
+        tools.addStretch(1)
+        tools.addWidget(self.surface_delete_button)
+        dp.addLayout(tools)
+        self.surface_list = QtWidgets.QListWidget()
+        self.surface_list.setToolTip("Surfaces sent to the track. Select one to edit it in the viewer.")
+        dp.addWidget(self.surface_list, 1)
+        self.surface_name_edit = QtWidgets.QLineEdit()
+        self.surface_name_edit.setPlaceholderText("Surface name")
+        self.surface_name_edit.setToolTip(
+            "Name of the selected surface; press Enter to rename. Its ReadGeo uses this name."
         )
-        mask_preview_note.setStyleSheet(
-            "color: #888;"
+        dp.addWidget(self.surface_name_edit)
+        # Renaming happens on Enter; the button stays for code that clicks it.
+        self.rename_button = QtWidgets.QPushButton("Rename")
+        self.rename_button.hide()
+        self.surface_status = _wrap(_label(
+            "Green: you're on the surface's guide frame. Grey: another frame.", "Faint"))
+        dp.addWidget(self.surface_status)
+        self.sidebar.addWidget(draw_page)
+
+        # Output --------------------------------------------------------------
+        output_page = QtWidgets.QWidget()
+        op = _vbox(output_page, (0, 0, 0, 0), 8)
+        op.addWidget(_label("OUTPUT", "Section"))
+        self.output_info = _wrap(_label("", "Dim"))
+        op.addWidget(self.output_info)
+        self.output_create_layout = QtWidgets.QVBoxLayout()
+        self.output_create_layout.setSpacing(6)
+        op.addLayout(self.output_create_layout)   # Create All, see _construct_panel
+        create_row = QtWidgets.QHBoxLayout()
+        self.create_one_button = QtWidgets.QPushButton("Create one")
+        self.create_one_button.setObjectName("MenuButton")
+        self.create_one_button.setAutoDefault(False)
+        self.create_one_button.setToolTip(
+            "Create a single asset from the solve: the camera, undistort, redistort, "
+            "a mesh, or one guided surface"
         )
-        mask_preview_note.setWordWrap(True)
-        ml.addWidget(mask_preview_note)
-
-        ml.addStretch(1)
-
-        self.masks_tab_index = sidebar.addTab(
-            masks_tab,
-            "Masks",
+        self.create_one_menu = QtWidgets.QMenu(self.create_one_button)
+        self.create_one_menu.aboutToShow.connect(
+            lambda: self._fill_create_menu(self.create_one_menu))
+        self.create_one_button.setMenu(self.create_one_menu)
+        create_row.addWidget(self.create_one_button, 1)
+        self.reveal_output_button = _icon_button(
+            "folder", "Open the solve version's folder", name="Tool")
+        create_row.addWidget(self.reveal_output_button)
+        op.addLayout(create_row)
+        op.addSpacing(10)
+        op.addWidget(_label("GEOMETRY", "Section"))
+        card = _frame("Card")
+        cl = _vbox(card, (10, 8, 10, 8), 4)
+        self.geometry_rows = []
+        for _key, text in ux.GEOMETRY_ITEMS:
+            row = QtWidgets.QHBoxLayout()
+            name = _label(text, "Dim")
+            state = _label("—", "Faint")
+            row.addWidget(name, 1)
+            row.addWidget(state)
+            cl.addLayout(row)
+            self.geometry_rows.append(state)
+        op.addWidget(card)
+        self.build_geometry_button = QtWidgets.QPushButton("  Build geometry")
+        self.build_geometry_button.setIcon(icons.icon("cube"))
+        self.build_geometry_button.setIconSize(icons.icon_size())
+        self.build_geometry_button.setAutoDefault(False)
+        self.build_geometry_button.setToolTip(
+            "Build the dense mesh, mesh-fit planes and guided surfaces for this solve. "
+            "Reuses the tracked camera, so only the geometry stages run."
         )
-        # Solve tab placeholder; panel is installed after construction.
-        self.solve_tab = QtWidgets.QWidget()
-        self.solve_layout = QtWidgets.QVBoxLayout(self.solve_tab)
-        self.solve_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar.addTab(self.solve_tab, "Solve")
+        op.addWidget(self.build_geometry_button)
+        op.addStretch(1)
+        self.sidebar.addWidget(output_page)
 
-        # The right properties area should remain comfortably readable at full
-        # screen, especially on 1440p/4K displays.
-        sidebar.setMinimumWidth(460)
-        sidebar.setMaximumWidth(680)
+        self.settings_toggle = QtWidgets.QPushButton("Solve settings…")
+        self.settings_toggle.setObjectName("Disclosure")
+        self.settings_toggle.setAutoDefault(False)
+        self.settings_toggle.setToolTip(
+            "Plate and output folders, solve version, quality, run mode, GPU and "
+            "dense settings, and the installation status"
+        )
+        side_layout.addWidget(self.settings_toggle)
 
-        self.main_splitter.addWidget(sidebar)
+        side.setMinimumWidth(260)
+        side.setMaximumWidth(440)
+        self.main_splitter = QtWidgets.QSplitter(_HORIZONTAL)
+        self.main_splitter.setHandleWidth(3)
+        self.main_splitter.addWidget(viewer_frame)
+        self.main_splitter.addWidget(side)
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
-        self.main_splitter.setCollapsible(1, False)
-        self.main_splitter.setSizes([1100, 500])
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setSizes([1300, 300])
+        root.addWidget(self.main_splitter, 1)
 
-        # Bottom status.
-        self.workspace_status = QtWidgets.QLabel("Ready")
-        self.workspace_status.setStyleSheet("color: #aaa; padding: 2px 4px;")
-        root.addWidget(self.workspace_status)
+        # -- bottom: transport with Track / Stop, then the timeline ----------
+        bottom = _frame("BottomBar")
+        bottom_layout = _vbox(bottom, (0, 0, 0, 0), 0)
+        self.timeline = GuideTimeline()
+        self._build_playback_bar(bottom_layout)
+        timeline_row = QtWidgets.QHBoxLayout()
+        timeline_row.setContentsMargins(0, 0, 10, 6)
+        timeline_row.addWidget(self.timeline, 1)
+        bottom_layout.addLayout(timeline_row)
+        root.addWidget(bottom)
+
+        # -- status bar: what to do next | last message ---------------------
+        status = _frame("StatusBar")
+        status.setFixedHeight(26)
+        sb = _hbox(status, (12, 0, 12, 0), 18)
+        self.hint_label = _elide(_label("", "Hint"))
+        sb.addWidget(self.hint_label, 3)
+        self.workspace_status = _elide(_label("Ready", "Faint"))
+        self.workspace_status.setAlignment(_ALIGN_RIGHT)
+        sb.addWidget(self.workspace_status, 2)
+        root.addWidget(status)
+
+        self._build_menus()
 
         # Wiring for workspace.
         self.fit_button.clicked.connect(self.canvas.fit_view)
@@ -1488,9 +1566,12 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.surface_delete_button.clicked.connect(self._delete_surface)
         self.guide_frame_button.clicked.connect(self._set_guide_frame)
         self.rename_button.clicked.connect(self._rename_surface)
+        self.surface_name_edit.returnPressed.connect(self._rename_surface)
         self.surface_list.currentRowChanged.connect(self._surface_list_changed)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.surfacesChanged.connect(self._canvas_surfaces_changed)
+        self.reveal_output_button.clicked.connect(self._reveal_output)
+        self.build_geometry_button.clicked.connect(lambda: self.panel.build_geometry())
 
         self.timeline.frameChanged.connect(
             self._timeline_frame_changed
@@ -1501,6 +1582,71 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.mask_invert_button.toggled.connect(
             self._mask_invert_toggled
         )
+
+    def _build_menus(self):
+        """Every action, including the ones without a button on screen."""
+        m = self.file_menu
+        _action(m, "Solve settings…", lambda: self._show_settings())
+        _action(m, "Open output folder", self._reveal_output)
+        m.addSeparator()
+        _action(m, "Installation status…", lambda: self.panel.check_environment())
+        _action(m, "Open install report", lambda: self.panel._open_install_report())
+        m.addSeparator()
+        _action(m, "Close", self.close)
+
+        m = self.track_menu
+        self.track_action = _action(m, "Track", lambda: self._track(), "T",
+                                    tip="Solve the camera and lens from the plate")
+        self.cancel_action = _action(m, "Stop tracking", lambda: self.panel.runner.cancel())
+        self.background_action = _action(
+            m, "Continue in background", lambda: self.panel.background_requested.emit(),
+            tip="Hide the workspace and keep tracking with a small progress window")
+        m.addSeparator()
+        self.invert_action = _action(m, "Invert tracking mask", lambda: self.mask_invert_button.toggle(),
+                                     checkable=True)
+        _action(m, "Refresh mask preview", self._refresh_mask_preview)
+        m.aboutToShow.connect(self._sync_track_menu)
+
+        m = self.draw_menu
+        _action(m, "Add plane", self._add_surface, "P")
+        _action(m, "Auto suggest planes", self._auto_suggest)
+        _action(m, "Set guide frame", self._set_guide_frame, "G")
+        _action(m, "Delete surface", self._delete_surface, "Del")
+        m.addSeparator()
+        self.use_guides_action = _action(
+            m, "Use surfaces in the track", lambda: self.panel.use_guides_checkbox.toggle(),
+            checkable=True, tip="Fit a projection plane to each surface when tracking")
+        _action(m, "Show guide Roto node", self._open_roto)
+        m.aboutToShow.connect(
+            lambda: self.use_guides_action.setChecked(self.panel.use_guides_checkbox.isChecked()))
+
+        m = self.output_menu
+        _action(m, "Create All", lambda: self.panel.import_last_result(), "Ctrl+E",
+                tip="Camera, lens nodes and all geometry, in the comp")
+        self.create_one_submenu = m.addMenu("Create one")
+        self.create_one_submenu.aboutToShow.connect(
+            lambda: self._fill_create_menu(self.create_one_submenu))
+        _action(m, "Build geometry", lambda: self.panel.build_geometry())
+        m.addSeparator()
+        _action(m, "Open output folder", self._reveal_output)
+
+        m = self.view_menu
+        _action(m, "Fit", self.canvas.fit_view, "F")
+        m.addSeparator()
+        for key, text in ux.WORKSPACE_STEPS:
+            index = ux.step_index(key) + 1
+            _action(m, text, lambda k=key: self._set_step(k), str(index))
+        m.addSeparator()
+        _action(m, "Log", self._show_log)
+        _action(m, "Clear frame cache", lambda: self._clear_frame_cache(),
+                tip="Forget the frames held in memory and read them from disk again")
+
+    def _sync_track_menu(self):
+        running = self.panel.runner.is_running()
+        self.track_action.setEnabled(not running)
+        self.cancel_action.setEnabled(running)
+        self.background_action.setEnabled(running)
+        self.invert_action.setChecked(self.mask_invert_button.isChecked())
 
     def _install_shortcuts(self):
         self.fit_shortcut = QShortcut(
@@ -1514,6 +1660,22 @@ class AutoLensDialog(QtWidgets.QDialog):
             self._fit_shortcut_triggered
         )
         self._install_playback_shortcuts()
+        for keys, slot in (
+            ("T", lambda: self._track()),
+            ("P", lambda: (self._set_step("draw"), self._add_surface())),
+            ("G", self._set_guide_frame),
+            ("Delete", self._delete_surface),
+            ("Ctrl+E", lambda: self.panel.import_last_result()),
+            ("1", lambda: self._set_step("track")),
+            ("2", lambda: self._set_step("draw")),
+            ("3", lambda: self._set_step("output")),
+        ):
+            shortcut = QShortcut(QtGui.QKeySequence(keys), self)
+            shortcut.setContext(WIDGET_WITH_CHILDREN_SHORTCUT)
+            shortcut.activated.connect(
+                lambda slot=slot: None if self._typing_in_field() else slot()
+            )
+            self.playback_shortcuts.append(shortcut)
 
     def _fit_shortcut_triggered(self):
         # Don't steal F while the artist is actively typing text/numbers in
@@ -1744,20 +1906,259 @@ class AutoLensDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        self.panel.controller_node = self.controller_node
-        self.panel.background_requested.connect(
+        p = self.panel
+        p.controller_node = self.controller_node
+        p.background_requested.connect(
             self.enter_background_mode
         )
 
-        # Surface editing now lives in the permanent left viewport.
-        if hasattr(self.panel, "guide_group"):
-            self.panel.guide_group.hide()
+        # The panel keeps all the solve logic. Its run controls move into the
+        # Track and Output pages; the rest becomes the Solve settings window.
+        # Surface editing lives in the viewer, and the step pills replace the
+        # panel's own step indicator.
+        for widget in (p.guide_group, p.step_label, p.step_hint_label,
+                       p.completed_result_checkbox, p.background_button):
+            widget.hide()
 
+        p.run_button.setObjectName("Primary")
+        p.run_button.setStyleSheet("")
+        p.run_button.setIcon(icons.icon("track", "#071317"))
+        p.run_button.setIconSize(icons.icon_size())
+        p.run_button.setMinimumHeight(32)
+        self.track_row.addWidget(p.run_button, 1)
+        self.quality_button = QtWidgets.QPushButton()
+        self.quality_button.setObjectName("MenuButton")
+        self.quality_button.setAutoDefault(False)
+        self.quality_button.setMinimumHeight(32)
+        self.quality_button.setToolTip("Quality and what happens after the track")
+        self.quality_menu = QtWidgets.QMenu(self.quality_button)
+        self.quality_menu.aboutToShow.connect(self._fill_quality_menu)
+        self.quality_button.setMenu(self.quality_menu)
+        self.track_row.addWidget(self.quality_button)
+        p.quality_combo.currentTextChanged.connect(lambda _t: self._sync_quality_button())
+        self._sync_quality_button()
+
+        self.track_status_layout.addWidget(p.stage_label)
+        self.track_status_layout.addWidget(p.progress)
+        p.cancel_button.setText("  Stop")
+        p.cancel_button.setIcon(icons.icon("stop", "#ff8a9a"))
+        p.cancel_button.setIconSize(icons.icon_size())
+        self.track_status_layout.addWidget(p.cancel_button)
+
+        # What's left of the panel's "2. Solve" box is the quality settings.
+        quality_box = p.quality_combo.parentWidget()
+        if isinstance(quality_box, QtWidgets.QGroupBox):
+            quality_box.setTitle("Quality")
+        for widget in (p.run_button, p.cancel_button):
+            _repolish(widget)
+
+        p.import_button.setObjectName("Primary")
+        p.import_button.setText("  Create All")
+        p.import_button.setIcon(icons.icon("create", "#071317"))
+        p.import_button.setIconSize(icons.icon_size())
+        p.import_button.setMinimumHeight(32)
+        self.output_create_layout.addWidget(p.import_button)
+        _repolish(p.import_button)
+        p.reveal_button.hide()
+
+        # View > Log.
+        self.log_dialog = QtWidgets.QDialog(self)
+        self.log_dialog.setWindowTitle("AutoLens log")
+        self.log_dialog.resize(820, 460)
+        old_log_box = p.log.parentWidget()
+        _vbox(self.log_dialog, (10, 10, 10, 10), 0).addWidget(p.log)
+        if old_log_box is not None:
+            old_log_box.hide()
+
+        # File > Solve settings.
+        self.settings_dialog = QtWidgets.QDialog(self)
+        self.settings_dialog.setWindowTitle("AutoLens solve settings")
+        self.settings_dialog.resize(560, 760)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setWidget(self.panel)
-        self.solve_layout.addWidget(scroll)
+        scroll.setWidget(p)
+        _vbox(self.settings_dialog, (0, 0, 0, 0), 0).addWidget(scroll)
+        self.settings_toggle.clicked.connect(self._show_settings)
+
+        p.runner.started.connect(self._refresh_workflow)
+        p.import_button.clicked.connect(
+            lambda: QtCore.QTimer.singleShot(0, self._refresh_workflow))
+
+    # ------------------------------------------------------------------
+    # Workflow: Track -> Draw -> Output
+    # ------------------------------------------------------------------
+    def _set_step(self, key):
+        self._step = ux.WORKSPACE_KEYS[ux.step_index(key)]
+        index = ux.step_index(self._step)
+        if self.sidebar.currentIndex() != index:
+            self.sidebar.setCurrentIndex(index)
+        self._refresh_workflow()
+
+    def _track(self):
+        self._set_step("track")
+        self.panel.run_autolens()
+
+    def _show_settings(self):
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def _show_log(self):
+        self.log_dialog.show()
+        self.log_dialog.raise_()
+
+    def _reveal_output(self):
+        try:
+            from .panel import _open_folder
+            _open_folder(self.panel._resolved_output_folder())
+        except Exception as exc:
+            self.workspace_status.setText(f"Couldn't open the output folder: {exc}")
+
+    def _sync_quality_button(self):
+        self.quality_button.setText(self.panel.quality_combo.currentText())
+
+    def _fill_quality_menu(self):
+        p = self.panel
+        menu = self.quality_menu
+        menu.clear()
+        group = _action_group(self)
+        for name in ux.QUALITY_ORDER:
+            a = _action(menu, name, lambda n=name: p.quality_combo.setCurrentText(n),
+                        checkable=True, tip=ux.preset_summary(name))
+            a.setChecked(p.quality_combo.currentText() == name)
+            group.addAction(a)
+        menu.addSeparator()
+        a = _action(menu, "Build geometry during the track",
+                    lambda: p.build_geometry_checkbox.toggle(), checkable=True,
+                    tip=p.build_geometry_checkbox.toolTip())
+        a.setChecked(p.build_geometry_checkbox.isChecked())
+        a = _action(menu, "Create All when the track finishes",
+                    lambda: p.import_when_done.toggle(), checkable=True,
+                    tip=p.import_when_done.toolTip())
+        a.setChecked(p.import_when_done.isChecked())
+        menu.addSeparator()
+        _action(menu, "More settings…", self._show_settings)
+
+    def _fill_create_menu(self, menu):
+        from .node import solve_item_options
+
+        menu.clear()
+        solved = bool(self.panel.last_result_nk)
+        try:
+            items = solve_item_options(self.controller_node) if solved else []
+        except Exception:
+            items = []
+        if not items:
+            a = menu.addAction("Track first")
+            a.setEnabled(False)
+            return
+        for item in items:
+            _action(menu, item, lambda i=item: self._create_one(i))
+
+    def _create_one(self, item):
+        from .node import create_selected_solve_item
+
+        try:
+            created = create_selected_solve_item(self.controller_node, item)
+        except Exception:
+            # create_selected_solve_item already told the artist why.
+            return
+        if created is not None:
+            self.workspace_status.setText(f"Created {created.name()}.")
+
+    def _solve_result(self):
+        """autolens_result.json of the selected version, re-read only when it changes."""
+        folder = self.panel._resolved_output_folder()
+        path = os.path.join(folder, "autolens_result.json") if folder else ""
+        try:
+            stamp = os.path.getmtime(path) if path else None
+        except OSError:
+            stamp = None
+        cached_path, cached_stamp, cached = self._result_cache
+        if cached_path == path and cached_stamp == stamp:
+            return cached
+        result = ux.load_result(folder) if stamp is not None else {}
+        self._result_cache = (path, stamp, result)
+        return result
+
+    def _refresh_workflow(self, *_args):
+        """Step pills, viewer chip, next-step hint and the Output page."""
+        if not hasattr(self, "panel"):
+            return
+        p = self.panel
+        running = p.runner.is_running()
+        solved = bool(p.last_result_nk)
+        failed = bool(p.last_failure) and not solved
+        result = self._solve_result() if solved else {}
+        geometry, items = ux.geometry_status(result)
+        surfaces = len(getattr(self.canvas, "surfaces", []) or [])
+        has_plate = self.read_node is not None
+        installed = bool(getattr(p, "_install_ready", True))
+
+        states = ux.workspace_step_states(
+            self._step, solved=solved, failed=failed,
+            surfaces=surfaces, created=bool(getattr(p, "_imported", False)),
+        )
+        for key, button in self.step_buttons.items():
+            if button.property("state") != states[key]:
+                button.setProperty("state", states[key])
+                button.style().unpolish(button)
+                button.style().polish(button)
+
+        text, chip_state = ux.solve_chip(
+            running=running, percent=self._last_percent, solved=solved and not running,
+            failed=failed, error_px=ux.result_error_px(result),
+        )
+        self.chip.setText(text)
+        self.chip.setStyleSheet(theme.chip_style(chip_state))
+
+        hint_args = dict(
+            has_plate=has_plate, installed=installed, running=running, solved=solved,
+            surfaces=surfaces, geometry_ready=geometry == "ready",
+            created=bool(getattr(p, "_imported", False)),
+        )
+        self.hint_label.setText(ux.workspace_hint(self._step, **hint_args))
+        self.track_info.setText(ux.workspace_hint("track", **hint_args))
+        self.draw_info.setText(ux.workspace_hint("draw", **hint_args))
+        self.output_info.setText(ux.workspace_hint("output", **hint_args))
+
+        for state_label, (_name, ready) in zip(self.geometry_rows, items):
+            if not solved:
+                state_label.setText("—")
+                state_label.setStyleSheet("")
+            elif ready:
+                state_label.setText("✓ ready")
+                state_label.setStyleSheet(f"color: {theme.CACHE};")
+            else:
+                state_label.setText("not built")
+                state_label.setStyleSheet(f"color: {theme.TEXT_FAINT};")
+        self.build_geometry_button.setEnabled(solved and not running)
+        self.build_geometry_button.setText(
+            "  Rebuild geometry" if geometry == "ready" else "  Build geometry")
+        self.create_one_button.setEnabled(solved)
+        self.track_transport_button.setEnabled(not running)
+        self.stop_transport_button.setEnabled(running)
+        p.cancel_button.setVisible(running)
+        p.progress.setVisible(running or p.progress.value() > 0)
+
+        read = self.read_node
+        width = height = 0
+        first = last = None
+        info = getattr(self, "_preview_info", {}) or {}
+        width, height = info.get("width", 0), info.get("height", 0)
+        if read is not None:
+            try:
+                frame_range = source_frame_range(read)
+                if frame_range:
+                    first, last = frame_range
+            except Exception:
+                pass
+        self.shot_label.setText(ux.shot_summary(
+            read.name() if read is not None else "",
+            width if width > 1 else 0, height if height > 1 else 0,
+            first, last, p._selected_version() if p.output_edit.text().strip() else "",
+        ))
 
     # ------------------------------------------------------------------
     # Existing node setting sync
@@ -2076,42 +2477,54 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._sharp_timer.timeout.connect(self._request_sharp)
 
         bar = QtWidgets.QHBoxLayout()
-        bar.setContentsMargins(4, 0, 4, 0)
-        bar.setSpacing(3)
+        bar.setContentsMargins(10, 6, 10, 6)
+        bar.setSpacing(4)
 
-        def button(text, tip, slot, width=34):
-            b = QtWidgets.QPushButton(text)
-            b.setToolTip(tip)
-            b.setFixedWidth(width)
+        def button(icon_name, tip, slot, name="Transport"):
+            b = _icon_button(icon_name, tip, name=name)
             # Keep keyboard focus off the transport so Space always plays.
             b.setFocusPolicy(NO_FOCUS)
             b.clicked.connect(slot)
             bar.addWidget(b)
             return b
 
-        button("|<", "First frame (Home)", lambda: self._go_to_end(-1))
-        button("<", "Previous frame (← or ,)", lambda: self._step(-1))
+        button("first", "First frame (Home)", lambda: self._go_to_end(-1))
+        button("prev", "Previous frame (← or ,)", lambda: self._step(-1))
+        self.frame_field = QtWidgets.QSpinBox()
+        self.frame_field.setObjectName("FrameField")
+        self.frame_field.setProperty("bare", True)
+        self.frame_field.setButtonSymbols(_NO_BUTTONS)
+        self.frame_field.setRange(-10000000, 10000000)
+        self.frame_field.setFixedWidth(72)
+        self.frame_field.setKeyboardTracking(False)
+        self.frame_field.setToolTip("Current frame: type a frame and press Enter")
+        self.frame_field.valueChanged.connect(self._frame_field_changed)
+        bar.addWidget(self.frame_field)
+        button("next", "Next frame (→ or .)", lambda: self._step(1))
+        button("last", "Last frame (End)", lambda: self._go_to_end(1))
+        bar.addSpacing(4)
         self.play_back_button = button(
-            "◀", "Play backwards", lambda: self._toggle_playback(-1)
+            "play_back", "Play backwards", lambda: self._toggle_playback(-1)
         )
         self.play_button = button(
-            "▶", "Play / pause (Space)", lambda: self._toggle_playback(1)
+            "play", "Play / pause (Space)", lambda: self._toggle_playback(1)
         )
-        button(">", "Next frame (→ or .)", lambda: self._step(1))
-        button(">|", "Last frame (End)", lambda: self._go_to_end(1))
-
+        bar.addSpacing(6)
         self.loop_button = QtWidgets.QPushButton("Loop")
+        self.loop_button.setObjectName("Toggle")
         self.loop_button.setCheckable(True)
         self.loop_button.setChecked(True)
         self.loop_button.setFocusPolicy(NO_FOCUS)
         self.loop_button.setToolTip("Loop playback over the source range")
         bar.addWidget(self.loop_button)
 
-        bar.addSpacing(6)
         self.fps_spin = QtWidgets.QDoubleSpinBox()
         self.fps_spin.setRange(1.0, 120.0)
-        self.fps_spin.setDecimals(3)
+        self.fps_spin.setDecimals(2)
         self.fps_spin.setSuffix(" fps")
+        self.fps_spin.setProperty("bare", True)
+        self.fps_spin.setButtonSymbols(_NO_BUTTONS)
+        self.fps_spin.setFixedWidth(78)
         self.fps_spin.setToolTip(
             "Playback speed. Frames that aren't decoded in time are skipped "
             "so playback stays in real time."
@@ -2123,18 +2536,24 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.fps_spin.setValue(fps if fps > 0 else 24.0)
         bar.addWidget(self.fps_spin)
 
+        # Centre: the one action of the Track step, as in Match.
+        bar.addStretch(1)
+        bar.addWidget(_label("Track", "Dim"))
+        bar.addSpacing(4)
+        self.track_transport_button = button(
+            "track", "Track the camera and lens (T)", lambda: self._track(), name="TrackButton"
+        )
+        self.stop_transport_button = button(
+            "stop", "Stop tracking", lambda: self.panel.runner.cancel(), name="Stop"
+        )
+        self.stop_transport_button.setEnabled(False)
         bar.addStretch(1)
 
-        self.cache_label = QtWidgets.QLabel("")
-        self.cache_label.setStyleSheet("color: #888;")
-        bar.addWidget(self.cache_label)
-
-        button(
-            "Clear",
-            "Forget the frames held in memory and read them from disk again.",
-            self._clear_frame_cache,
-            width=52,
+        self.cache_label = _label("", "Faint")
+        self.cache_label.setToolTip(
+            "Frames decoded in memory (green in the timeline). View > Clear frame cache forgets them."
         )
+        bar.addWidget(self.cache_label)
 
         layout.addLayout(bar)
 
@@ -2405,6 +2824,10 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
         self._view_frame = frame
         self.timeline.set_current_frame(frame)
+        if self.frame_field.value() != frame:
+            self.frame_field.blockSignals(True)
+            self.frame_field.setValue(frame)
+            self.frame_field.blockSignals(False)
         self.canvas.set_current_frame(frame)
         self._preview.protect = {frame}
 
@@ -2668,8 +3091,14 @@ class AutoLensDialog(QtWidgets.QDialog):
     def _sync_play_buttons(self):
         playing = self._playing()
         direction = self._play_clock.direction if self._play_clock else 1
-        self.play_button.setText("||" if playing and direction > 0 else "▶")
-        self.play_back_button.setText("||" if playing and direction < 0 else "◀")
+        self.play_button.setIcon(icons.icon("pause" if playing and direction > 0 else "play"))
+        self.play_back_button.setIcon(icons.icon("pause" if playing and direction < 0 else "play_back"))
+
+    def _frame_field_changed(self, frame):
+        if frame == self._view_frame:
+            return
+        self._stop_playback(settle=False)
+        self._show_frame(int(frame), settle=True)
 
     def _step(self, delta):
         self._stop_playback(settle=False)
@@ -2820,6 +3249,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self._refresh_timeline()
 
     def _canvas_surfaces_changed(self, surfaces):
+        QtCore.QTimer.singleShot(0, self._refresh_workflow)
         self._commit_surfaces()
 
     def _canvas_selection_changed(self, index):
@@ -3153,8 +3583,10 @@ class AutoLensDialog(QtWidgets.QDialog):
             percent,
         )
         self.workspace_status.setText(
-            f"{stage} — {int(percent)}%"
+            self.panel.runner.progress_text() or f"{stage} — {int(percent)}%"
         )
+        self._last_percent = int(percent)
+        self._refresh_workflow()
 
     def _finished(self, exit_code):
         if exit_code == 0:
@@ -3163,7 +3595,15 @@ class AutoLensDialog(QtWidgets.QDialog):
                 "Complete",
                 100,
             )
-            self.workspace_status.setText("AutoLens solve complete.")
+            self.workspace_status.setText("Track complete.")
+            # Track -> Draw -> Output: move on once the track lands. A
+            # geometry build or an auto Create All goes straight to Output.
+            if self._step == "track":
+                surfaces = len(self.canvas.surfaces or [])
+                created = bool(getattr(self.panel, "_imported", False))
+                self._set_step("output" if created else ux.next_step_after_solve(surfaces))
+            elif self._step == "draw" and getattr(self.panel, "_imported", False):
+                self._set_step("output")
         else:
             set_status(
                 self.controller_node,
@@ -3176,8 +3616,10 @@ class AutoLensDialog(QtWidgets.QDialog):
                 )
             else:
                 self.workspace_status.setText(
-                    "AutoLens stopped or failed. See the Solve tab log."
+                    "AutoLens stopped or failed. See View > Log."
                 )
+        self._last_percent = 0
+        self._set_step(self._step)
 
     def closeEvent(self, event):
         if self.panel.runner.is_running():
@@ -3257,8 +3699,8 @@ def show_autolens_dialog(controller_node):
         QtCore.QTimer.singleShot(
             0,
             lambda d=dialog: d.main_splitter.setSizes([
-                max(700, d.width() - 500),
-                500,
+                max(700, d.width() - 310),
+                310,
             ]),
         )
     except Exception:

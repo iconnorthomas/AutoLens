@@ -403,3 +403,187 @@ def failure_message(info):
     if detail and detail not in info["reason"]:
         lines += ["", "Engine message: " + detail]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Workspace: Track -> Draw -> Output
+# ---------------------------------------------------------------------------
+
+WORKSPACE_STEPS = (("track", "Track"), ("draw", "Draw"), ("output", "Output"))
+WORKSPACE_KEYS = tuple(key for key, _label in WORKSPACE_STEPS)
+
+# Engine flags for the two kinds of run. A track that leaves geometry for
+# later skips the dense stages. "Build geometry" is a Resume run without the
+# flag: it reuses the cached camera solve and only computes what's missing.
+CAMERA_ONLY_ARGS = ("--skip-dense",)
+BUILD_GEOMETRY_ARGS = ()
+
+
+def solve_args(build_geometry=True):
+    """Extra engine flags for a track, depending on whether geometry is built now."""
+    return list(BUILD_GEOMETRY_ARGS if build_geometry else CAMERA_ONLY_ARGS)
+
+
+def step_index(key):
+    """Position of a workspace step, falling back to Track."""
+    try:
+        return WORKSPACE_KEYS.index(str(key))
+    except ValueError:
+        return 0
+
+
+def workspace_step_states(current, solved=False, failed=False, surfaces=0, created=False):
+    """
+    State of each step pill: "current", "done", "warn" or "todo".
+
+    Draw is optional, so it only counts as done once a surface exists.
+    """
+    current = WORKSPACE_KEYS[step_index(current)]
+    done = {
+        "track": bool(solved),
+        "draw": int(surfaces) > 0,
+        "output": bool(created),
+    }
+    states = {}
+    for key in WORKSPACE_KEYS:
+        if key == current:
+            states[key] = "current"
+        elif key == "track" and failed and not solved:
+            states[key] = "warn"
+        elif done[key]:
+            states[key] = "done"
+        else:
+            states[key] = "todo"
+    return states
+
+
+def next_step_after_solve(surfaces):
+    """Where the workspace goes when a track finishes."""
+    return "output" if int(surfaces) > 0 else "draw"
+
+
+def workspace_hint(step, has_plate=True, installed=True, running=False, solved=False,
+                   surfaces=0, geometry_ready=False, created=False):
+    """One line telling the artist what to do next on `step`."""
+    step = WORKSPACE_KEYS[step_index(step)]
+    surfaces = int(surfaces)
+    if not has_plate:
+        return "Connect the plate's Read to AutoLens input 0, then reopen AutoLens."
+    if not installed:
+        return "AutoLens isn't installed yet: close Nuke, run install_autolens.bat, then reopen it."
+
+    if step == "track":
+        if running:
+            return "Tracking. Keep drawing surfaces while it runs, or continue in the background."
+        if solved:
+            return "Tracked. Draw surfaces next, or go straight to Output."
+        return "Play the plate, mask anything that moves, then click Track."
+
+    if step == "draw":
+        if surfaces == 0:
+            return "Add a plane (P) and drag its corners onto a flat surface, or Auto Suggest. Optional."
+        noun = "surface" if surfaces == 1 else "surfaces"
+        tail = " Then go to Output." if solved else " Track to fit them."
+        return f"{surfaces} {noun}. Set each one's guide frame (G) on the frame you drew it.{tail}"
+
+    if not solved:
+        return "Track the camera first: the camera and lens come from the track."
+    if not geometry_ready:
+        return "Camera and lens are ready. Build geometry for the mesh and surfaces, or Create All now."
+    if created:
+        return "Created in the comp. Create All again after editing surfaces."
+    return "Create All builds the camera, lens and geometry in the comp."
+
+
+def solve_chip(running=False, percent=0, solved=False, failed=False, error_px=None):
+    """(text, state) for the viewer's status chip."""
+    if running:
+        return f"TRACKING {max(0, min(100, int(percent)))}%", "running"
+    if solved:
+        if error_px is not None:
+            try:
+                return f"SOLVED · {float(error_px):.2f} px", "solved"
+            except (TypeError, ValueError):
+                pass
+        return "SOLVED", "solved"
+    if failed:
+        return "FAILED", "failed"
+    return "NOT SOLVED", "none"
+
+
+GEOMETRY_ITEMS = (
+    ("proxy_mesh_obj", "Proxy mesh"),
+    ("meshfit_planes_obj", "Mesh-fit planes"),
+    ("guided_surfaces_obj", "Guided surfaces"),
+)
+
+
+def load_result(output_folder):
+    """The solve's autolens_result.json as a dict, or {} when there isn't one."""
+    import json
+    from pathlib import Path
+
+    if not output_folder:
+        return {}
+    path = Path(str(output_folder)) / "autolens_result.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def result_error_px(result):
+    """Mean sparse reprojection error from a result dict, or None."""
+    value = (result or {}).get("mean_sparse_reprojection_error_px")
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def geometry_status(result, exists=None):
+    """
+    Geometry items for the Output step.
+
+    Returns (overall, items): overall is "none" (no solve), "missing" (no proxy
+    mesh yet) or "ready"; items is a list of (label, ready) pairs. `exists` is
+    a path predicate, injectable for tests.
+    """
+    if exists is None:
+        from os.path import exists as _exists
+        exists = _exists
+    if not result:
+        return "none", [(label, False) for _key, label in GEOMETRY_ITEMS]
+    outputs = result.get("geometry_outputs") or {}
+    items = []
+    for key, label in GEOMETRY_ITEMS:
+        path = outputs.get(key)
+        items.append((label, bool(path) and bool(exists(path))))
+    overall = "ready" if items[0][1] else "missing"
+    return overall, items
+
+
+_NICE_STEPS = (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000)
+
+
+def timeline_tick_step(frame_span, width_px, min_px=70):
+    """Frames between labelled timeline ticks, so labels sit at least `min_px` apart."""
+    frame_span = max(1, int(frame_span))
+    width_px = max(1.0, float(width_px))
+    for step in _NICE_STEPS:
+        if step * width_px / frame_span >= min_px:
+            return step
+    return _NICE_STEPS[-1]
+
+
+def shot_summary(read_name="", width=0, height=0, first=None, last=None, version=""):
+    """Top-bar breadcrumb, e.g. `Plate: Read1 · 1920×1080 · 1001–1087 · v2`."""
+    parts = [f"Plate: {read_name}" if read_name else "No plate"]
+    if width and height:
+        parts.append(f"{int(width)}×{int(height)}")
+    if first is not None and last is not None:
+        parts.append(f"{int(first)}–{int(last)}")
+    if version:
+        parts.append(str(version))
+    return " · ".join(parts)

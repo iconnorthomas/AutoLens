@@ -590,7 +590,9 @@ def _add_knobs(node, source_read=None):
     )
     node.addKnob(result_status)
 
-    node.addKnob(nuke.Text_Knob("autolens_sep1", "", ""))
+    # Everything below lives on the Advanced tab. The workspace shows the
+    # same settings, so most artists never need to come here.
+    node.addKnob(nuke.Tab_Knob("autolens_advanced_tab", "AutoLens Advanced"))
 
     quality = nuke.Enumeration_Knob(
         "autolens_quality", "Quality", ["Preview", "Normal", "High"]
@@ -685,9 +687,7 @@ def _add_knobs(node, source_read=None):
         pass
     node.addKnob(mask_invert)
 
-    # Options most artists never change live on the Advanced tab. The Solve
-    # panel mirrors them, so moving them doesn't change behaviour.
-    node.addKnob(nuke.Tab_Knob("autolens_advanced_tab", "AutoLens Advanced"))
+    node.addKnob(nuke.Text_Knob("autolens_sep1", "", ""))
 
     mode = nuke.Enumeration_Knob(
         "autolens_run_mode", "Run mode",
@@ -725,8 +725,8 @@ def _add_knobs(node, source_read=None):
         "autolens_help", "",
         "Connect AutoLens directly after the plate (or an upstream chain containing the plate Read). "
         "The image passes through unchanged.<br>"
-        "1. Open AutoLens... and click Solve.  2. Click Create All for the camera, lens and geometry.<br>"
-        "Surfaces and a tracking mask (input 1) are optional."
+        "Open AutoLens... then Track, Draw (optional) and Output. Create All builds the camera, "
+        "lens and geometry.<br>A tracking mask on input 1 is optional."
     )
     node.addKnob(help_k)
 
@@ -1648,7 +1648,17 @@ def _create_readgeo(path, name, label=""):
     return geo
 
 
-def create_selected_solve_item(node):
+def solve_item_options(node):
+    """Everything Create from solve can make for the controller's selected version."""
+    try:
+        output = resolved_output_folder(node)
+    except Exception:
+        output = ""
+    return _create_item_options(output)
+
+
+def create_selected_solve_item(node, selection=None):
+    """Create one solved asset: `selection`, or the Create from solve knob's choice."""
     ensure_runtime_knobs(node)
 
     # Always rescan solved assets at click time too.
@@ -1667,10 +1677,11 @@ def create_selected_solve_item(node):
         )
         return None
 
-    try:
-        selection = node["autolens_create_item"].value()
-    except Exception:
-        selection = "Camera"
+    if not selection:
+        try:
+            selection = node["autolens_create_item"].value()
+        except Exception:
+            selection = "Camera"
 
     try:
         if selection == "Camera":

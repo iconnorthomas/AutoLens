@@ -30,7 +30,7 @@ from .runner import AutoLensRunner
 from .importer import import_result
 from .ux import (
     QUALITY_PRESETS, QUALITY_ORDER, RUN_MODES, preset_name, preset_summary,
-    settings_match_preset, run_mode_args, current_step, step_hint,
+    settings_match_preset, run_mode_args, solve_args, current_step, step_hint,
     step_indicator_html, explain_failure, failure_message, format_duration,
 )
 from .surface_guides import (
@@ -139,6 +139,7 @@ class AutoLensPanel(QtWidgets.QWidget):
         self.last_failure = None
         self._imported = False
         self._install_ready = False
+        self._geometry_run = False
         # Refreshes elapsed time / ETA between the engine's stage updates.
         self._progress_timer = QtCore.QTimer(self)
         self._progress_timer.setInterval(1000)
@@ -333,6 +334,12 @@ class AutoLensPanel(QtWidgets.QWidget):
         )
         self.sparse_gpu = QtWidgets.QCheckBox("GPU accelerate feature extraction / matching"); self.sparse_gpu.setChecked(True)
         self.sparse_gpu.setToolTip("Use the GPU for COLMAP features and matching. Turn off only if the GPU stages fail.")
+        self.build_geometry_checkbox = QtWidgets.QCheckBox("Build geometry during the track")
+        self.build_geometry_checkbox.setChecked(True)
+        self.build_geometry_checkbox.setToolTip(
+            "On: one run solves the camera and lens and builds the dense mesh and surfaces.\n"
+            "Off: track the camera and lens only (much faster); build geometry later from Output."
+        )
         self.selection_combo = QtWidgets.QComboBox(); self.selection_combo.addItems(["smart", "step", "all"])
         self.selection_combo.setToolTip(
             "How dense reference frames are picked. smart: best-spread viewpoints (recommended); "
@@ -362,6 +369,7 @@ class AutoLensPanel(QtWidgets.QWidget):
         self.fusion_cache_edit.setToolTip("Fusion cache size in GB, or auto.")
         adv.addRow("Run mode", self.run_mode)
         adv.addRow("", self.sparse_gpu)
+        adv.addRow("", self.build_geometry_checkbox)
         adv.addRow("Dense selection", self.selection_combo); adv.addRow("Dense max dimension", self.resolution_spin)
         adv.addRow("Max smart references", self.target_spin); adv.addRow("Minimum references", self.minimum_spin)
         adv.addRow("Sparse coverage target", self.coverage_spin); adv.addRow("Source views / reference", self.sources_spin)
@@ -656,12 +664,14 @@ class AutoLensPanel(QtWidgets.QWidget):
         idx = self.quality_combo.findText(quality)
         if idx >= 0: self.quality_combo.setCurrentIndex(idx)
         self.import_when_done.setChecked(str(self.settings.value("import_when_done", "true")).lower() != "false")
+        self.build_geometry_checkbox.setChecked(str(self.settings.value("build_geometry", "true")).lower() != "false")
         self._refresh_install_status()
 
 
     def _save_settings(self):
         self.settings.setValue("quality", self.quality_combo.currentText())
         self.settings.setValue("import_when_done", self.import_when_done.isChecked())
+        self.settings.setValue("build_geometry", self.build_geometry_checkbox.isChecked())
 
 
     def _quality_changed(self, label):
@@ -1134,7 +1144,12 @@ class AutoLensPanel(QtWidgets.QWidget):
         if self.sparse_gpu.isChecked(): args.append("--use-gpu")
         colmap = self.colmap_edit.text().strip()
         if colmap: args += ["--colmap", colmap]
-        args += run_mode_args(self.run_mode.currentIndex())
+        if self._geometry_run:
+            # Build geometry: resume the existing solve and run the dense stages.
+            args += solve_args(build_geometry=True)
+        else:
+            args += run_mode_args(self.run_mode.currentIndex())
+            args += solve_args(self.build_geometry_checkbox.isChecked())
 
         if not self.upright_world_checkbox.isChecked():
             args.append("--no-upright-world")
@@ -1319,25 +1334,25 @@ class AutoLensPanel(QtWidgets.QWidget):
 
         if reusable:
             self.run_button.setText(
-                "Resume Solve"
+                "  Resume Track"
             )
             self.run_button.setToolTip(
-                "Solve the camera, lens and geometry. A previous solve was found "
+                "Track the camera and lens (T). A previous track was found "
                 "in this version folder, so finished stages are reused."
             )
         else:
             self.run_button.setText(
-                "Solve"
+                "  Track"
             )
 
             if resume_mode:
                 self.run_button.setToolTip(
-                    "Solve the camera, lens and geometry for this plate into the "
+                    "Track the camera and lens from this plate (T), into the "
                     "selected version folder."
                 )
             else:
                 self.run_button.setToolTip(
-                    "Solve using the Run mode chosen under Advanced: "
+                    "Track using the Run mode chosen in Solve settings: "
                     + self.run_mode.currentText()
                 )
 
@@ -1564,6 +1579,25 @@ class AutoLensPanel(QtWidgets.QWidget):
         )
 
 
+    def build_geometry(self):
+        """Build the dense mesh and surfaces for the selected solve, reusing its camera."""
+        if self.runner.is_running():
+            return
+        if not self._discover_result_path():
+            QtWidgets.QMessageBox.information(
+                self,
+                "AutoLens",
+                "There's no finished track in the selected solve version yet.\n\n"
+                "What to do: click Track first.",
+            )
+            return
+        self._geometry_run = True
+        try:
+            self.run_autolens()
+        finally:
+            # run_autolens has built its arguments (or bailed out) by now.
+            self._geometry_run = False
+
     def run_autolens(self):
         if self.runner.is_running():
             return
@@ -1571,7 +1605,7 @@ class AutoLensPanel(QtWidgets.QWidget):
         if not self._preflight_before_run():
             return
 
-        action = self._ask_existing_result_action()
+        action = "overwrite" if self._geometry_run else self._ask_existing_result_action()
         if action is None:
             return
 

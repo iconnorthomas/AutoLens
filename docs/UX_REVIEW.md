@@ -178,3 +178,61 @@ Surfaces and the tracking mask stay optional side-steps before Solve.
 - **Better ETA.** Weighting stages by their typical share of run time (dense depth
   maps dominate) would beat the current linear estimate. That needs timing data
   from real solves.
+
+## 6. Second pass: Match-style workspace (Track › Draw › Output)
+
+The artist's real order is: open AutoLens, track, draw shapes, output. The
+first pass kept the old Surfaces / Masks / Solve tabs, so the workspace still
+opened on drawing, buried the Track button in a long settings tab, and showed
+about 20 controls at once. This pass rebuilds the workspace in the style of
+the Match tool. One theme (`autolens/theme.py`) and one painted icon set
+(`autolens/icons.py`) are shared by every button, and nothing ships as image files.
+
+### New layout
+
+| Area | What's there |
+|---|---|
+| Top bar | AUTOLENS wordmark · File / Track / Draw / Output / View menus · `Plate: Read1 · 1920×1080 · 1001–1087 · v2` · **Track › Draw › Output** pills (current one cyan, done ones green, a failed track red). |
+| Viewer | The plate, a status chip (*NOT SOLVED*, *TRACKING 42%*, *SOLVED · 0.29 px*, *FAILED*) and the frame, plus Fit. |
+| Side panel | Only the current step. **Track:** Track button, quality popover, inline progress and Stop, tracking-mask status and Invert. **Draw:** four icon tools (add plane, auto suggest, guide frame, delete), the surface list and a name field. **Output:** Create All, Create one ▾, open folder, geometry status and Build geometry. *Solve settings…* sits at the bottom. |
+| Transport | first / prev / frame field / next / last, play back / play, Loop, fps. In the centre, **Track** and **Stop**. On the right, the cache count. |
+| Timeline | Lanes with labels: a frame ruler, *Guides* (one blue mark per surface guide frame) and *Cache* (frames in memory or on disk). |
+| Status bar | The next-step hint on the left, the last message (frame info, progress, errors) on the right. |
+
+The node's main tab now holds only the title, status, **Open AutoLens...**,
+**Create All** and the result line. Quality, output root, solve version and
+Create from solve moved to the AutoLens Advanced tab on new nodes.
+
+### What moved where (nothing removed)
+
+| Was | Now |
+|---|---|
+| Surfaces / Masks / Solve tabs | Track / Draw / Output pages, switched by the pills or keys 1–3 |
+| Solve tab: plate, output, version, Advanced, install box | **File › Solve settings…** (the same panel, in its own window) |
+| Quality combo, *Create when finished* | The quality popover next to Track (also in Solve settings) |
+| Background button | **Track › Continue in background**. Closing the window while tracking still offers it. |
+| Log box | **View › Log** |
+| Rename button | Type in the name field and press Enter |
+| Reveal Output | The folder button on Output, or **File › Open output folder** |
+| Clear (frame cache) | **View › Clear frame cache** |
+| Create from solve + Create (node only) | **Create one ▾** on Output and **Output › Create one** (still on the node's Advanced tab) |
+| Install status / report | **File › Installation status…** / **Open install report** |
+| Use surface guides (checkbox) | **Draw › Use surfaces in the track** (also in Solve settings) |
+| — | New: **Build geometry** and *Build geometry during the track* (off = camera and lens only, via the engine's `--skip-dense`) |
+
+### Step counts, before (first pass) and after
+
+| Task | First pass | This pass |
+|---|---|---|
+| Camera + lens + geometry, no surfaces (clicks after selecting the Read) | 4 (create node, Open AutoLens..., Solve tab, Solve) | 3 (create node, Open AutoLens..., Track) |
+| Draw surfaces after a track, then create | 6 (Surfaces tab, add, drag, set guide frame, Solve tab, Create All) | 5 (the workspace moves to Draw itself: add, drag, set guide frame, Output, Create All) |
+| Controls on the side panel at once | ≈ 20 on the Solve tab | 3 on Track (Track, quality, Invert), 6 on Draw, 4 on Output |
+| Controls on the node's main tab | 8 | 2 (Open AutoLens..., Create All) |
+| Geometry for a camera-only track | Re-run the whole track with different settings | One click: Build geometry |
+
+### Testing
+
+The step logic, chip, hints, geometry status, tick spacing and theme are pure
+Python in `ux.py` and `theme.py`, covered by `tests/test_workspace.py`. The Qt
+layout itself can only be checked in NukeX (PySide2 in Nuke 14, PySide6 in
+Nuke 16+).

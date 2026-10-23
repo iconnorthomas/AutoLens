@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **New workspace layout: Track › Draw › Output** (Match style; see `docs/UX_REVIEW.md`).
+  - A dark, flat theme and painted icons. The top bar has File / Track / Draw / Output / View
+    menus, the plate breadcrumb and step pills.
+  - The side panel shows only the current step.
+    - **Track:** the Track button, a quality popover, inline progress and the tracking mask.
+    - **Draw:** surface tools and the surface list.
+    - **Output:** Create All, Create one, geometry status and Build geometry.
+  - A chip over the viewer reads *NOT SOLVED*, *TRACKING n%*, then *SOLVED · 0.29 px*.
+  - The transport has Track and Stop in the centre, and the timeline has *Guides* and *Cache* lanes.
+  - The workspace moves to Draw (or Output) when a track finishes.
+  - Shortcuts: T track, P add plane, G guide frame, Del delete, Ctrl+E Create All, 1–3 steps.
+  - Plate, output, version, run mode, GPU and dense settings are in **File › Solve settings…**;
+    the log is in **View › Log**. Every earlier control is still reachable.
+- **Build geometry later.** *Build geometry during the track* (on by default) can be switched off
+  to track only the camera and lens. **Build geometry** on Output then runs just the geometry
+  stages, reusing the tracked camera.
+- **Smaller node panel.** New AutoLens nodes show only Open AutoLens..., the status and Create All
+  on the main tab. Quality, output and Create from solve are on the AutoLens Advanced tab.
+
 - **Faster solves.** Shots over 60 frames are matched sequentially (each frame against its
   next 20 frames plus frames 32, 64, 128… ahead) instead of exhaustively. That is about 6x fewer
   image pairs at 250 frames. If sequential matching registers under 90% of the frames, AutoLens
