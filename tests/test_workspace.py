@@ -194,6 +194,66 @@ class GeometryOverviewTests(unittest.TestCase):
         self.assertIn("Build geometry again", hint)
 
 
+class TrackTimeTests(unittest.TestCase):
+    RESULT = {"timings": {
+        "total_seconds_before_nuke_script": 546.2,
+        "stages": [
+            {"stage": "feature_extractor", "seconds": 40.0},
+            {"stage": "patch_match_stereo", "seconds": 300.0},
+            {"stage": "feature_extractor", "seconds": 10.0},
+            ["mapper", 120.5],
+            {"stage": "broken", "seconds": "x"},
+            "nonsense",
+        ],
+    }}
+
+    def test_result_timing(self):
+        total, stages = ux.result_timing(self.RESULT)
+        self.assertAlmostEqual(total, 546.2)
+        self.assertEqual(stages, [("feature_extractor", 50.0), ("patch_match_stereo", 300.0), ("mapper", 120.5)])
+        self.assertEqual(ux.result_timing({}), (None, []))
+
+    def test_engine_only(self):
+        info = ux.track_time(self.RESULT)
+        self.assertAlmostEqual(info["total"], 546.2)
+        self.assertIsNone(info["prep"])
+        self.assertEqual(ux.track_time_text(info), "9m 06s")
+        self.assertEqual(ux.track_time_text(ux.track_time({})), "")
+
+    def test_with_nuke_prep(self):
+        ui = ux.ui_timing_payload(12.4, 550.0, finished_unix=1)
+        self.assertEqual(ui, {"kind": "track", "prep_seconds": 12.4, "engine_seconds": 550.0,
+                              "total_seconds": 562.4, "finished_unix": 1})
+        info = ux.track_time(self.RESULT, ui)
+        self.assertAlmostEqual(info["total"], 562.4)
+        self.assertAlmostEqual(info["prep"], 12.4)
+        self.assertEqual(ux.track_time_text(info), "9m 22s")
+
+    def test_timing_lines(self):
+        info = ux.track_time(self.RESULT, ux.ui_timing_payload(12, 550))
+        lines = ux.timing_lines(info)
+        self.assertEqual(lines[0], ("Nuke prep (plate, mask, guides)", "12s"))
+        self.assertEqual(lines[1], ("patch_match_stereo", "5m 00s"))  # longest first
+        self.assertEqual(lines[-1], ("Total", "9m 22s"))
+        self.assertEqual(ux.timing_lines({}), [])
+        many = {"total": 10.0, "stages": [("s%d" % i, 1.0) for i in range(5)]}
+        lines = ux.timing_lines(many, limit=2)
+        self.assertEqual(lines[2], ("3 more stages", "3s"))
+
+    def test_load_ui_timing(self):
+        self.assertEqual(ux.load_ui_timing(""), {})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(ux.load_ui_timing(tmp), {})
+            (Path(tmp) / ux.UI_TIMING_FILE).write_text('{"track": {"engine_seconds": 5}}', encoding="utf-8")
+            self.assertEqual(ux.load_ui_timing(tmp)["track"]["engine_seconds"], 5)
+
+    def test_chip_shows_duration(self):
+        self.assertEqual(ux.solve_chip(solved=True, error_px=0.3, duration="9m 06s"),
+                         ("SOLVED · 0.30 px · 9m 06s", "solved"))
+        self.assertEqual(ux.solve_chip(solved=True, duration="9m 06s"),
+                         ("SOLVED · 9m 06s", "solved"))
+
+
 class TimelineTests(unittest.TestCase):
     def test_tick_step(self):
         self.assertEqual(ux.timeline_tick_step(87, 1800), 5)

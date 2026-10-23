@@ -19,6 +19,15 @@
   to track only the camera and lens (`--skip-dense`). **Build geometry** on Output then runs just
   the geometry stages from the cached solve (`--geometry-only`). Output shows the build's progress,
   and whether it finished, failed or was interrupted, from `autolens_geometry_status.json`.
+- **The tracking-mask overlay plays with the shot.**
+  - Overlays fill in idle time, outward from the playhead, and pause during playback.
+  - A frame that isn't ready shows the nearest ready one, so there's no flicker.
+  - A red *Mask* lane on the timeline shows the ready frames.
+  - The cache clears only when the mask's graph or keys change.
+- **Track time.** The SOLVED chip shows how long the track took (*SOLVED · 0.30 px · 9m 06s*),
+  including the Nuke-side prep before the engine starts. The status bar shows it when a track
+  finishes, and Output › Timing breaks it down by stage. It's saved in `autolens_ui_timing.json`
+  beside the result.
 - **Smaller node panel.** New AutoLens nodes show only Open AutoLens..., the status and Create All
   on the main tab. Quality, output and Create from solve are on the AutoLens Advanced tab.
 

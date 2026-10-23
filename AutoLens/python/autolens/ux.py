@@ -509,18 +509,22 @@ def workspace_hint(step, has_plate=True, installed=True, running=False, solved=F
     return "Create All builds the camera, lens and geometry in the comp."
 
 
-def solve_chip(running=False, percent=0, solved=False, failed=False, error_px=None, building=False):
+def solve_chip(running=False, percent=0, solved=False, failed=False, error_px=None, building=False,
+               duration=""):
     """(text, state) for the viewer's status chip."""
     if running:
         verb = "BUILDING GEOMETRY" if building else "TRACKING"
         return f"{verb} {max(0, min(100, int(percent)))}%", "running"
     if solved:
+        parts = ["SOLVED"]
         if error_px is not None:
             try:
-                return f"SOLVED · {float(error_px):.2f} px", "solved"
+                parts.append(f"{float(error_px):.2f} px")
             except (TypeError, ValueError):
                 pass
-        return "SOLVED", "solved"
+        if duration:
+            parts.append(str(duration))
+        return " · ".join(parts), "solved"
     if failed:
         return "FAILED", "failed"
     return "NOT SOLVED", "none"
@@ -635,6 +639,126 @@ def geometry_overview(result, status=None, running=False, exists=None):
     if state == "failed" and overall != "ready":
         return "failed", items, str(status.get("error") or "")
     return overall, items, ""
+
+
+# ---------------------------------------------------------------------------
+# Track time
+# ---------------------------------------------------------------------------
+
+# Written by the workspace beside autolens_result.json when a run finishes:
+# the Nuke-side prep (plate proxy, mask and guide export) and the engine's
+# wall time, so the total matches what the artist waited.
+UI_TIMING_FILE = "autolens_ui_timing.json"
+
+
+def result_timing(result):
+    """
+    (engine_seconds or None, [(stage, seconds)]) from a result's `timings`.
+
+    Stages with the same name (e.g. COLMAP retries) are added together, in
+    the order they first ran.
+    """
+    timings = (result or {}).get("timings") or {}
+    total = timings.get("total_seconds_before_nuke_script")
+    try:
+        total = None if total is None else float(total)
+    except (TypeError, ValueError):
+        total = None
+    stages, order = {}, []
+    for entry in timings.get("stages") or []:
+        if isinstance(entry, dict):
+            name, seconds = entry.get("stage"), entry.get("seconds")
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            name, seconds = entry[0], entry[1]
+        else:
+            continue
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            continue
+        name = str(name or "?")
+        if name not in stages:
+            order.append(name)
+            stages[name] = 0.0
+        stages[name] += seconds
+    return total, [(name, stages[name]) for name in order]
+
+
+def load_ui_timing(output_folder):
+    """The workspace's saved timing for the solve in `output_folder`, or {}."""
+    import json
+    from pathlib import Path
+
+    if not output_folder:
+        return {}
+    try:
+        payload = json.loads((Path(str(output_folder)) / UI_TIMING_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def ui_timing_payload(prep_seconds, engine_seconds, kind="track", finished_unix=None):
+    """What the workspace saves in UI_TIMING_FILE after a successful run."""
+    prep = max(0.0, float(prep_seconds or 0.0))
+    engine = max(0.0, float(engine_seconds or 0.0))
+    return {
+        "kind": str(kind),
+        "prep_seconds": round(prep, 3),
+        "engine_seconds": round(engine, 3),
+        "total_seconds": round(prep + engine, 3),
+        "finished_unix": int(finished_unix if finished_unix is not None else time.time()),
+    }
+
+
+def track_time(result, ui_timing=None):
+    """
+    How long the last run took: {"total", "prep", "engine", "stages", "kind"}.
+
+    With the workspace's saved timing, total = Nuke prep + engine wall time
+    (what the artist waited). Without it (a solve run elsewhere, or by an older
+    build), total is the engine's own figure. total is None when unknown.
+    """
+    engine_total, stages = result_timing(result)
+    ui = ui_timing or {}
+    prep = ui.get("prep_seconds")
+    engine = ui.get("engine_seconds")
+    try:
+        prep = None if prep is None else float(prep)
+        engine = None if engine is None else float(engine)
+    except (TypeError, ValueError):
+        prep = engine = None
+    if engine is not None:
+        total = (prep or 0.0) + engine
+    else:
+        engine = engine_total
+        total = engine_total
+    return {"total": total, "prep": prep, "engine": engine, "stages": stages,
+            "kind": str(ui.get("kind") or "track")}
+
+
+def track_time_text(info):
+    """Short total, e.g. '9m 06s', or '' when unknown."""
+    total = (info or {}).get("total")
+    return "" if total is None else format_duration(total)
+
+
+def timing_lines(info, limit=12):
+    """Breakdown lines for the Output step and the log, longest stages first."""
+    info = info or {}
+    if info.get("total") is None:
+        return []
+    lines = []
+    if info.get("prep") is not None:
+        lines.append(("Nuke prep (plate, mask, guides)", info["prep"]))
+    stages = sorted(info.get("stages") or [], key=lambda item: -item[1])
+    shown = stages[:limit]
+    lines.extend(shown)
+    rest = sum(seconds for _name, seconds in stages[limit:])
+    if rest > 0:
+        lines.append((f"{len(stages) - limit} more stages", rest))
+    lines.append(("Total", info["total"]))
+    return [(name, format_duration(seconds)) for name, seconds in lines]
 
 
 _NICE_STEPS = (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000)

@@ -51,11 +51,14 @@ from .surface_guides import (
     clamp_frame_to_source,
     source_frame_range,
 )
+from .mask_cache import OverlayCache, fill_order
 from .tracking_masks import (
     mask_input_connected,
     mask_inverted,
+    mask_overlay_job,
+    mask_signature,
+    overlay_pixmap,
     set_mask_inverted,
-    render_mask_overlay_pixmap,
 )
 
 _DIALOGS = {}
@@ -132,6 +135,11 @@ _NO_BUTTONS = getattr(
     QtWidgets.QAbstractSpinBox,
     "NoButtons",
     getattr(getattr(QtWidgets.QAbstractSpinBox, "ButtonSymbols", object()), "NoButtons", 2),
+)
+_RICH_TEXT = getattr(
+    QtCore.Qt,
+    "RichText",
+    getattr(getattr(QtCore.Qt, "TextFormat", object()), "RichText", 1),
 )
 _SIZE_IGNORED = getattr(
     QtWidgets.QSizePolicy,
@@ -826,9 +834,10 @@ class GuideTimeline(QtWidgets.QWidget):
         # (start, end) runs: decoded in memory / rendered proxies on disk.
         self.cached_ranges = []
         self.disk_ranges = []
+        self.mask_ranges = []   # frames whose mask overlay is ready
         self.scrubbing = False
-        self.setMinimumHeight(58)
-        self.setMaximumHeight(62)
+        self.setMinimumHeight(66)
+        self.setMaximumHeight(70)
         self.setMouseTracking(True)
         self.setFocusPolicy(CLICK_FOCUS)
 
@@ -843,6 +852,12 @@ class GuideTimeline(QtWidgets.QWidget):
         self.cached_ranges = memory_ranges
         self.disk_ranges = disk_ranges
         self.update()
+
+    def set_mask_ranges(self, ranges):
+        ranges = list(ranges or [])
+        if ranges != self.mask_ranges:
+            self.mask_ranges = ranges
+            self.update()
 
     def set_range(self, first_frame, last_frame):
         self.first_frame = int(first_frame)
@@ -887,7 +902,7 @@ class GuideTimeline(QtWidgets.QWidget):
     GUTTER = 64
     RIGHT_PAD = 14
     RULER_Y = 16
-    LANES = (("Guides", 30), ("Cache", 48))
+    LANES = (("Guides", 30), ("Mask", 44), ("Cache", 56))
 
     def _x_for_frame(self, frame):
         left = float(self.GUTTER)
@@ -972,8 +987,17 @@ class GuideTimeline(QtWidgets.QWidget):
             x = int(round(self._x_for_frame(frame)))
             painter.fillRect(x - 2, guide_y - 6, 5, 12, guide)
 
+        # Mask lane: frames whose tracking-mask overlay is ready to play.
+        mask_y = self.LANES[1][1]
+        painter.fillRect(left, mask_y - 1, max(1, right - left), 3, QtGui.QColor("#1a1d21"))
+        for start, end in self.mask_ranges:
+            x0 = max(left, int(round(self._x_for_frame(start - 0.5))))
+            x1 = min(right, int(round(self._x_for_frame(end + 0.5))))
+            if x1 >= x0:
+                painter.fillRect(x0, mask_y - 1, max(1, x1 - x0), 3, QtGui.QColor(theme.MASK))
+
         # Cache lane: dark = proxy rendered to disk, bright = decoded in memory.
-        cache_y = self.LANES[1][1]
+        cache_y = self.LANES[2][1]
         painter.fillRect(left, cache_y - 1, max(1, right - left), 3, QtGui.QColor("#1a1d21"))
         for ranges, color in (
             (self.disk_ranges, QtGui.QColor(theme.CACHE_DISK)),
@@ -1514,6 +1538,18 @@ class AutoLensDialog(QtWidgets.QDialog):
             "Reuses the tracked camera, so only the geometry stages run."
         )
         op.addWidget(self.build_geometry_button)
+        op.addSpacing(6)
+        self.timing_toggle = QtWidgets.QPushButton("Timing \u25b8")
+        self.timing_toggle.setObjectName("Disclosure")
+        self.timing_toggle.setCheckable(True)
+        self.timing_toggle.setAutoDefault(False)
+        self.timing_toggle.setToolTip("How long the last track took, stage by stage")
+        op.addWidget(self.timing_toggle)
+        self.timing_label = _wrap(_label("", "Dim"))
+        self.timing_label.setTextFormat(_RICH_TEXT)
+        self.timing_label.hide()
+        op.addWidget(self.timing_label)
+        self.timing_toggle.toggled.connect(self._timing_toggled)
         op.addStretch(1)
         self.sidebar.addWidget(output_page)
 
@@ -1607,7 +1643,8 @@ class AutoLensDialog(QtWidgets.QDialog):
         m.addSeparator()
         self.invert_action = _action(m, "Invert tracking mask", lambda: self.mask_invert_button.toggle(),
                                      checkable=True)
-        _action(m, "Refresh mask preview", self._refresh_mask_preview)
+        _action(m, "Refresh mask preview", lambda: self._refresh_mask_preview(clear=True),
+                tip="Sample the mask overlay again for every frame")
         m.aboutToShow.connect(self._sync_track_menu)
 
         m = self.draw_menu
@@ -1779,6 +1816,7 @@ class AutoLensDialog(QtWidgets.QDialog):
             self._reload_masks()
             self._refresh_mask_preview(force=True)
         else:
+            self._stop_mask_fill()
             self.canvas.clear_mask_overlay()
             self.canvas.update()
 
@@ -1845,13 +1883,15 @@ class AutoLensDialog(QtWidgets.QDialog):
             bool(checked),
         )
         self._reload_masks()
-        self._mask_overlays.clear()
 
         if (
             self.sidebar.currentIndex()
             == self.masks_tab_index
         ):
-            self._refresh_mask_preview()
+            self._refresh_mask_preview(clear=True)
+        else:
+            self._mask_overlays.clear()
+            self._mask_overlays.signature = None
 
         self.workspace_status.setText(
             "Mask interpretation inverted. "
@@ -1859,12 +1899,21 @@ class AutoLensDialog(QtWidgets.QDialog):
         )
 
 
-    def _refresh_mask_preview(self, frame=None, force=False):
+    def _refresh_mask_preview(self, frame=None, force=False, clear=False):
+        """
+        Show the mask overlay for `frame` (default: the shown frame) and keep
+        the idle filler going. `force` re-checks the mask's graph signature
+        (the cache is cleared only if the mask changed); `clear` always
+        starts over.
+        """
         if not mask_input_connected(
             self.controller_node
         ):
+            self._stop_mask_fill()
             self._mask_overlays.clear()
+            self._mask_overlays.signature = None
             self.canvas.clear_mask_overlay()
+            self.timeline.set_mask_ranges(())
             return
 
         if frame is None or isinstance(frame, bool):
@@ -1872,37 +1921,110 @@ class AutoLensDialog(QtWidgets.QDialog):
             force = force or isinstance(frame, bool)
             frame = self._view_frame if self._view_frame is not None else int(nuke.frame())
         frame = int(frame)
-        if force:
+        if clear:
             self._mask_overlays.clear()
-        cached = self._mask_overlays.get(frame)
-        if cached is not None:
-            self.canvas.set_mask_overlay(cached, visible=True)
+            self._mask_overlays.signature = None
+            self._mask_job = None
+        if force or clear or self._mask_overlays.signature is None:
+            self._check_mask_signature()
+
+        self._show_mask_overlay(frame)
+        self._start_mask_fill()
+
+    def _check_mask_signature(self):
+        """Clear the overlay cache when the mask's upstream graph or keys changed."""
+        try:
+            signature = mask_signature(self.controller_node)
+        except Exception:
+            signature = None
+        if self._mask_overlays.update_signature(signature):
+            self._mask_job = None
+            self.timeline.set_mask_ranges(())
+            return True
+        return False
+
+    def _show_mask_overlay(self, frame, direction=0):
+        # A frame that isn't sampled yet shows the nearest one that is, so the
+        # overlay never blinks while the cache fills.
+        overlay = self._mask_overlays.stand_in(frame, direction)
+        self.canvas.set_mask_overlay(
+            overlay if overlay is not None else QtGui.QPixmap(),
+            visible=True,
+        )
+
+    def _start_mask_fill(self):
+        if not self._mask_fill_timer.isActive():
+            self._mask_fill_logged = False
+            self._mask_fill_timer.start()
+
+    def _stop_mask_fill(self):
+        self._mask_fill_timer.stop()
+        self._mask_job = None
+
+    def _mask_fill_tick(self):
+        """Sample a few rows of the next missing overlay, nearest the playhead first."""
+        if not self.canvas.show_mask_overlay or not mask_input_connected(self.controller_node):
+            self._stop_mask_fill()
+            return
+        if self._playing():
+            # Sampling during playback would stutter; the stand-in covers gaps.
+            return
+        playhead = self._view_frame if self._view_frame is not None else int(nuke.frame())
+        cache = self._mask_overlays
+        wanted = fill_order(
+            playhead, self.timeline.first_frame, self.timeline.last_frame,
+            ready=cache.frames(), limit=1,
+        )
+        if not wanted:
+            self._mask_fill_timer.stop()
+            self._log_mask_fill(done=True)
+            return
+        want = wanted[0]
+        job = self._mask_job
+        if job is None or job.frame in cache or (job.frame != want and job.rows_done * 2 < job.height):
+            try:
+                job = mask_overlay_job(self.controller_node, want)
+            except Exception as exc:
+                self._stop_mask_fill()
+                self.workspace_status.setText(f"Mask preview failed: {exc}")
+                return
+            if job is None:
+                self._stop_mask_fill()
+                return
+            self._mask_job = job
+        if not job.frame_explicit and job.frame != int(nuke.frame()):
+            # This Nuke build can only sample its current frame: fill the
+            # shown frame once it settles, never move Nuke's frame from here.
+            self._stop_mask_fill()
             return
 
-        self.workspace_status.setText(
-            "Rendering mask preview…"
-        )
-        QtWidgets.QApplication.processEvents()
+        if not job.step(0.010):
+            return
+        self._mask_job = None
+        if job.error is not None:
+            self._stop_mask_fill()
+            self.workspace_status.setText(f"Mask preview failed on frame {job.frame}: {job.error}")
+            return
+        cache.add(job.frame, overlay_pixmap(job), job.seconds)
+        if job.frame == self._view_frame or self._view_frame not in cache:
+            self._show_mask_overlay(self._view_frame if self._view_frame is not None else job.frame)
+        self.timeline.set_mask_ranges(cache.ranges())
+        if cache.filled == 10:
+            self._log_mask_fill()
 
+    def _log_mask_fill(self, done=False):
+        cache = self._mask_overlays
+        if not cache.filled or (done and self._mask_fill_logged):
+            return
+        self._mask_fill_logged = done
+        what = "all frames ready" if done else f"{cache.filled} frames so far"
         try:
-            overlay = render_mask_overlay_pixmap(
-                self.controller_node,
-                frame,
+            self.panel._append_log(
+                f"\n[AUTOLENS MASK] Overlay cache: {what}, "
+                f"{cache.ms_per_frame():.0f} ms per frame sampled.\n"
             )
-            self._mask_overlays[frame] = overlay
-            self.canvas.set_mask_overlay(
-                overlay,
-                visible=True,
-            )
-            self.workspace_status.setText(
-                "20% red = area AutoLens will avoid during tracking."
-            )
-        except Exception as exc:
-            self.canvas.clear_mask_overlay()
-            self.workspace_status.setText(
-                f"Mask preview failed: {exc}"
-            )
-
+        except Exception:
+            pass
 
     def _construct_panel(self):
         # Clear the selection while the solve panel builds so it can't pick up
@@ -2085,6 +2207,39 @@ class AutoLensDialog(QtWidgets.QDialog):
         if created is not None:
             self.workspace_status.setText(f"Created {created.name()}.")
 
+    def _timing_toggled(self, shown):
+        self.timing_toggle.setText("Timing \u25be" if shown else "Timing \u25b8")
+        self.timing_label.setVisible(bool(shown) and bool(self.timing_label.text()))
+
+    def _update_timing(self, timing, geometry_timing=None):
+        """Chip tooltip and the Output step's Timing breakdown."""
+        lines = ux.timing_lines(timing)
+        base_tip = (
+            "Track status. After a track it shows the mean reprojection error "
+            "(under about 1 px is a good solve) and how long the track took."
+        )
+        if not lines:
+            self.chip.setToolTip(base_tip)
+            self.timing_label.setText("")
+            self.timing_toggle.setEnabled(False)
+            self.timing_label.hide()
+            return
+        rows = "".join(
+            f"<tr><td>{name}</td><td align='right'>&nbsp;&nbsp;{text}</td></tr>"
+            for name, text in lines
+        )
+        extra = ""
+        if geometry_timing and geometry_timing.get("total_seconds") is not None:
+            extra = (
+                "<br>Last geometry build: "
+                + ux.format_duration(float(geometry_timing["total_seconds"]))
+            )
+        html = f"<table>{rows}</table>{extra}"
+        self.timing_label.setText(html)
+        self.timing_toggle.setEnabled(True)
+        self.timing_label.setVisible(self.timing_toggle.isChecked())
+        self.chip.setToolTip(base_tip + "<br><br>" + html)
+
     def _solve_result(self):
         """autolens_result.json of the selected version, re-read only when it changes."""
         folder = self.panel._resolved_output_folder()
@@ -2128,12 +2283,16 @@ class AutoLensDialog(QtWidgets.QDialog):
                 button.style().unpolish(button)
                 button.style().polish(button)
 
+        ui_timing = ux.load_ui_timing(folder) if solved else {}
+        timing = ux.track_time(result, ui_timing.get("track")) if solved else {}
         text, chip_state = ux.solve_chip(
             running=running, percent=self._last_percent, solved=solved and not running,
             failed=failed, error_px=ux.result_error_px(result), building=building,
+            duration=ux.track_time_text(timing),
         )
         self.chip.setText(text)
         self.chip.setStyleSheet(theme.chip_style(chip_state))
+        self._update_timing(timing, ui_timing.get("geometry"))
 
         hint_args = dict(
             has_plate=has_plate, installed=installed, running=running, solved=solved,
@@ -2474,7 +2633,13 @@ class AutoLensDialog(QtWidgets.QDialog):
     def _build_playback_bar(self, layout):
         """Transport controls under the timeline, plus the frame cache."""
         self._view_frame = None
-        self._mask_overlays = {}  # frame -> overlay pixmap for the connected mask
+        # frame -> overlay pixmap for the connected mask, filled in idle time.
+        self._mask_overlays = OverlayCache()
+        self._mask_job = None
+        self._mask_fill_logged = False
+        self._mask_fill_timer = QtCore.QTimer(self)
+        self._mask_fill_timer.setInterval(15)
+        self._mask_fill_timer.timeout.connect(self._mask_fill_tick)
         self._view_exact = False
         self._displayed_frame = None
         self._preview_mode = None          # "qt", "server" or None
@@ -2871,13 +3036,7 @@ class AutoLensDialog(QtWidgets.QDialog):
         self.canvas.set_current_frame(frame)
         self._preview.protect = {frame}
         if self.canvas.show_mask_overlay:
-            # Never show another frame's mask: an uncached frame shows none
-            # until it settles and its overlay is sampled.
-            overlay = self._mask_overlays.get(frame)
-            self.canvas.set_mask_overlay(
-                overlay if overlay is not None else QtGui.QPixmap(),
-                visible=True,
-            )
+            self._show_mask_overlay(frame, direction)
 
         pixmap = self._preview.pixmap(frame)
         if pixmap is not None:
@@ -3630,12 +3789,12 @@ class AutoLensDialog(QtWidgets.QDialog):
                 activation_change is not None
                 and event.type() == activation_change
                 and self.isActiveWindow()
-                and self._mask_overlays
+                and self.sidebar.currentIndex() == self.masks_tab_index
             ):
-                # The mask may have been re-keyed in Nuke while we were away.
-                self._mask_overlays.clear()
-                if self.sidebar.currentIndex() == self.masks_tab_index:
-                    QtCore.QTimer.singleShot(0, self._refresh_mask_preview)
+                # The mask may have been re-keyed in Nuke while we were away;
+                # the signature check refills only if it was.
+                QtCore.QTimer.singleShot(
+                    0, lambda: self._refresh_mask_preview(force=True))
         except Exception:
             pass
 
@@ -3663,7 +3822,15 @@ class AutoLensDialog(QtWidgets.QDialog):
                 "Complete",
                 100,
             )
-            self.workspace_status.setText("Track complete.")
+            timing = getattr(self.panel, "last_run_timing", None) or {}
+            took = ux.track_time_text(timing)
+            what = "Geometry build" if getattr(self.panel, "_run_kind", "track") == "geometry" else "Track"
+            if took and timing.get("prep") is not None:
+                self.workspace_status.setText(
+                    f"{what} complete in {took} (Nuke prep {ux.format_duration(timing['prep'])})."
+                )
+            else:
+                self.workspace_status.setText(f"{what} complete" + (f" in {took}." if took else "."))
             # Track -> Draw -> Output: move on once the track lands. A
             # geometry build or an auto Create All goes straight to Output.
             if self._step == "track":

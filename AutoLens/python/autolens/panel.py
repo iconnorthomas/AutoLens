@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import time
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from .importer import import_result
 from .ux import (
     QUALITY_PRESETS, QUALITY_ORDER, RUN_MODES, preset_name, preset_summary,
     settings_match_preset, run_mode_args, solve_args, geometry_only_args, current_step, step_hint,
+    UI_TIMING_FILE, ui_timing_payload, track_time, timing_lines, load_result,
     step_indicator_html, explain_failure, failure_message, format_duration,
 )
 from .surface_guides import (
@@ -140,6 +142,9 @@ class AutoLensPanel(QtWidgets.QWidget):
         self._imported = False
         self._install_ready = False
         self._geometry_run = False
+        self._run_kind = "track"
+        self.last_prep_seconds = 0.0
+        self.last_run_timing = None
         # True while the engine process is a Build geometry run, not a track.
         self.geometry_build_running = False
         # Refreshes elapsed time / ETA between the engine's stage updates.
@@ -1615,6 +1620,10 @@ class AutoLensPanel(QtWidgets.QWidget):
         if action is None:
             return
 
+        # Everything from here to the engine starting is Nuke-side prep the
+        # artist waits for (plate proxy, mask and guide export).
+        prep_started = time.perf_counter()
+        self._run_kind = "geometry" if self._geometry_run else "track"
         output_folder = Path(
             self._resolved_output_folder()
         )
@@ -1643,6 +1652,7 @@ class AutoLensPanel(QtWidgets.QWidget):
         self._imported = False
         self.stage_label.setText("Starting AutoLens…")
         self.stage_label.setStyleSheet("")
+        self.last_prep_seconds = time.perf_counter() - prep_started
         self.runner.start(self.python_edit.text().strip() or "python", str(engine_path()), args)
 
     def _process_started(self):
@@ -1664,9 +1674,7 @@ class AutoLensPanel(QtWidgets.QWidget):
             self._remember_result_path(str(nk_path))
             self.restore_result_state()
             self._set_completed_result_progress(True)
-            self._append_log(
-                f"\n[AUTOLENS] Solve finished in {format_duration(self.runner.estimator.elapsed())}.\n"
-            )
+            self._save_run_timing(output)
 
             if self.import_when_done.isChecked():
                 try: self.import_last_result()
@@ -1698,6 +1706,33 @@ class AutoLensPanel(QtWidgets.QWidget):
                 "detail": "",
             })
         self._update_step_indicator()
+
+    def _save_run_timing(self, output):
+        """Save and log how long the run took: Nuke prep + engine wall time."""
+        kind = getattr(self, "_run_kind", "track")
+        prep = float(getattr(self, "last_prep_seconds", 0.0) or 0.0)
+        engine = float(self.runner.estimator.elapsed())
+        path = Path(output) / UI_TIMING_FILE
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(saved, dict):
+                saved = {}
+        except Exception:
+            saved = {}
+        saved[kind] = ui_timing_payload(prep, engine, kind)
+        try:
+            path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self._append_log(f"\n[AUTOLENS] Could not save the run time: {exc}\n")
+        info = track_time(load_result(output), saved[kind])
+        self.last_run_timing = info
+        what = "Geometry build" if kind == "geometry" else "Track"
+        lines = [f"\n[AUTOLENS] {what} finished in {format_duration(prep + engine)} "
+                 f"(Nuke prep {format_duration(prep)}, engine {format_duration(engine)})."]
+        for name, text in timing_lines(info):
+            if name != "Total":
+                lines.append(f"[AUTOLENS TIMING]   {name}: {text}")
+        self._append_log("\n".join(lines) + "\n")
 
     def _show_failure(self, info):
         cancelled = info["title"] == "Solve cancelled"
